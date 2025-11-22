@@ -3,19 +3,25 @@ from typing import Any, Dict, List
 
 from .config import settings
 
-HEADERS = {
-    "Authorization": f"Bearer {settings.tradier_token}",
+# Sandbox auth (positions)
+POS_HEADERS = {
+    "Authorization": f"Bearer {settings.tradier_sandbox_token}",
+    "Accept": "application/json",
+}
+
+# Live auth (quotes)
+QUOTE_HEADERS = {
+    "Authorization": f"Bearer {settings.tradier_live_token}",
     "Accept": "application/json",
 }
 
 
 async def fetch_positions(client: httpx.AsyncClient, account_id: str) -> List[Dict[str, Any]]:
     """
-    GET /accounts/{account_id}/positions
-    Returns a list of Tradier position objects.
+    Sandbox positions: uses sandbox base URL + sandbox token.
     """
-    url = f"{settings.tradier_base}/accounts/{account_id}/positions"
-    r = await client.get(url, headers=HEADERS, timeout=15)
+    url = f"{settings.tradier_sandbox_base}/accounts/{account_id}/positions"
+    r = await client.get(url, headers=POS_HEADERS, timeout=15)
     r.raise_for_status()
     js = r.json().get("positions", {}).get("position")
     if js is None:
@@ -27,8 +33,7 @@ async def fetch_positions(client: httpx.AsyncClient, account_id: str) -> List[Di
 
 async def fetch_quotes(client: httpx.AsyncClient, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
     """
-    GET /markets/quotes?symbols=...
-    Returns dict: symbol_upper -> quote dict
+    Live quotes: uses live base URL + live token.
     """
     if not symbols:
         return {}
@@ -38,8 +43,8 @@ async def fetch_quotes(client: httpx.AsyncClient, symbols: List[str]) -> Dict[st
 
     for i in range(0, len(unique), 70):
         batch = unique[i : i + 70]
-        url = f"{settings.tradier_base}/markets/quotes?symbols={','.join(batch)}"
-        r = await client.get(url, headers=HEADERS, timeout=15)
+        url = f"{settings.tradier_live_base}/markets/quotes?symbols={','.join(batch)}"
+        r = await client.get(url, headers=QUOTE_HEADERS, timeout=15)
         r.raise_for_status()
         qs = r.json().get("quotes", {}).get("quote")
         if not qs:
