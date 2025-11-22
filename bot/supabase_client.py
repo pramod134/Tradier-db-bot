@@ -62,7 +62,11 @@ def upsert_position_row(row: Dict[str, Any]) -> str:
     Uses Supabase 'upsert' on conflict id.
     """
     clean = _sanitize_row(row)
-    sb.table("positions").upsert(clean, on_conflict="id").execute()
+    try:
+        sb.table("positions").upsert(clean, on_conflict="id").execute()
+    except Exception as e:
+        log("error", "supabase_upsert_error", row=clean, error=str(e))
+        raise
     return "upserted"
 
 
@@ -103,4 +107,9 @@ def update_quote_fields(pid: str, fields: Dict[str, Any]) -> None:
     Update mark / prev_close / underlier_spot / last_updated for a given position id.
     """
     clean = _sanitize_row(fields)
-    sb.table("positions").update(clean).eq("id", pid).execute()
+    try:
+        sb.table("positions").update(clean).eq("id", pid).execute()
+    except Exception as e:
+        # This will dump the exact payload that could not be JSON-encoded
+        log("error", "supabase_update_error", id=pid, fields=clean, error=str(e))
+        raise
