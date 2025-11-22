@@ -16,10 +16,17 @@ def _now_iso() -> str:
 
 async def run_positions_loop() -> None:
     """
-    Periodically sync positions from Tradier into public.positions.
+    Periodically sync positions from Tradier SANDBOX into public.positions.
+    - Uses sandbox token + sandbox base URL.
+    - Writes/updates rows whose id starts with 'tradier:{account_id}:{symbol}'.
     """
     interval = max(3, settings.poll_positions_sec)
-    log("info", "positions_loop_start", interval=interval, accounts=settings.tradier_accounts)
+    log(
+        "info",
+        "positions_loop_start",
+        interval=interval,
+        sandbox_accounts=settings.tradier_sandbox_accounts,
+    )
 
     while True:
         start = datetime.now(timezone.utc)
@@ -27,9 +34,14 @@ async def run_positions_loop() -> None:
             async with httpx.AsyncClient() as client:
                 current_ids: List[str] = []
 
-                for account_id in settings.tradier_accounts:
+                for account_id in settings.tradier_sandbox_accounts:
                     positions = await tradier_client.fetch_positions(client, account_id)
-                    log("info", "tradier_positions_fetched", account_id=account_id, count=len(positions))
+                    log(
+                        "info",
+                        "tradier_sandbox_positions_fetched",
+                        account_id=account_id,
+                        count=len(positions),
+                    )
 
                     for p in positions:
                         sym_raw = str(p.get("symbol", "")).upper()
@@ -43,7 +55,6 @@ async def run_positions_loop() -> None:
                         avg_cost = cost_basis_total / qty if qty not in (0, 0.0) else None
 
                         # Determine option vs equity
-                        # Prefer instrument.asset_type if present
                         inst = p.get("instrument") or {}
                         inst_type = str(inst.get("asset_type", "")).lower()
                         is_option = inst_type == "option" or len(sym_raw) > 15
@@ -55,7 +66,7 @@ async def run_positions_loop() -> None:
                         symbol = sym_raw
                         occ = sym_raw if is_option else None
 
-                        # Build primary key id
+                        # Build primary key id using sandbox account id
                         pid = supabase_client.build_tradier_id(account_id, symbol)
 
                         row: Dict[str, Any] = {
@@ -65,8 +76,9 @@ async def run_positions_loop() -> None:
                             "occ": occ,
                             "qty": qty,
                             "avg_cost": avg_cost,
-                            "mark": None,          # filled in quotes loop
-                            "prev_close": None,    # filled in quotes loop
+                            # price fields are filled by quotes loop
+                            "mark": None,
+                            "prev_close": None,
                             "contract_multiplier": contract_multiplier,
                             "underlier_spot": None,
                             "last_updated": _now_iso(),
@@ -74,9 +86,17 @@ async def run_positions_loop() -> None:
 
                         current_ids.append(pid)
                         status = supabase_client.upsert_position_row(row)
-                        log("info", "position_upsert", id=pid, asset_type=asset_type, qty=qty, status=status)
+                        log(
+                            "info",
+                            "position_upsert",
+                            id=pid,
+                            asset_type=asset_type,
+                            qty=qty,
+                            status=status,
+                            env="sandbox",
+                        )
 
-                # Clean up stale Tradier positions
+                # Delete sandbox-origin positions that no longer exist at Tradier
                 supabase_client.delete_missing_tradier_positions(current_ids)
 
         except Exception as e:
@@ -89,10 +109,13 @@ async def run_positions_loop() -> None:
 
 async def run_quotes_loop() -> None:
     """
-    Periodically refresh quote fields for active positions:
+    Periodically refresh quote fields for active positions using LIVE quotes:
     - mark
     - prev_close
     - underlier_spot
+
+    Positions may come from sandbox, but quotes are from live env
+    via tradier_client.fetch_quotes().
     """
     interval = max(2, settings.poll_quotes_sec)
     log("info", "quotes_loop_start", interval=interval)
@@ -110,7 +133,7 @@ async def run_quotes_loop() -> None:
                 symbol = str(r.get("symbol", "")).upper()
                 underlier = str(r.get("underlier") or "").upper()
 
-                # Always quote symbol (stock or OCC)
+                # Always quote the main symbol (stock or OCC)
                 if symbol:
                     symbols_to_quote.append(symbol)
                 # For options also quote the underlier if present
@@ -120,7 +143,7 @@ async def run_quotes_loop() -> None:
             async with httpx.AsyncClient() as client:
                 quotes = await tradier_client.fetch_quotes(client, symbols_to_quote)
 
-            # Update each position
+            # Update each position with live marks
             for r in active:
                 pid = r["id"]
                 symbol = str(r.get("symbol", "")).upper()
@@ -132,17 +155,18 @@ async def run_quotes_loop() -> None:
                 underlier_spot = None
 
                 if asset_type == "option":
-                    # Option price from symbol (OCC)
+                    # Option quote from OCC symbol
                     oq = quotes.get(symbol)
                     if oq:
                         mark = oq.get("last") or oq.get("close")
                         prev_close = oq.get("prevclose")
 
-                    # Underlier spot from underlier symbol
+                    # Underlier quote from parsed underlier symbol
                     if underlier:
                         uq = quotes.get(underlier)
                         if uq:
                             underlier_spot = uq.get("last") or uq.get("close")
+
                 else:
                     # Equity: symbol is the stock itself
                     sq = quotes.get(symbol)
@@ -159,7 +183,7 @@ async def run_quotes_loop() -> None:
                 }
                 supabase_client.update_quote_fields(pid, fields)
 
-            log("info", "quotes_updated", count=len(active))
+            log("info", "quotes_updated", count=len(active), env="live")
 
         except Exception as e:
             log("error", "quotes_loop_error", error=str(e))
