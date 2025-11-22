@@ -1,3 +1,5 @@
+import math
+from datetime import datetime, date
 from typing import Any, Dict, List
 
 from supabase import Client, create_client
@@ -5,32 +7,75 @@ from supabase import Client, create_client
 from .config import settings
 from .logger import log
 
+
+# ---------- JSON sanitization helpers ----------
+
+def _sanitize_value(v: Any) -> Any:
+    """
+    Make sure a value is safe to send through Supabase's JSON client:
+    - datetimes/dates -> ISO strings
+    - NaN / +/-inf -> None
+    - dicts/lists -> sanitized recursively
+    - everything else -> unchanged
+    """
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return None
+        return v
+
+    if isinstance(v, dict):
+        return {k: _sanitize_value(x) for k, x in v.items()}
+
+    if isinstance(v, list):
+        return [_sanitize_value(x) for x in v]
+
+    return v
+
+
+def _sanitize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: _sanitize_value(v) for k, v in row.items()}
+
+
+# ---------- Supabase client ----------
+
 sb: Client = create_client(settings.supabase_url, settings.supabase_key)
 
 
+# ---------- Helpers for positions ----------
+
 def build_tradier_id(account_id: str, symbol: str) -> str:
-    # Single stable primary key per Tradier account + symbol/OCC
+    """
+    Build a stable primary key for Tradier positions.
+    Example: tradier:12345678:SPY250919C00450000
+    """
     return f"tradier:{account_id}:{symbol.upper()}"
 
 
 def upsert_position_row(row: Dict[str, Any]) -> str:
     """
-    Upsert by primary key 'id' using Supabase's upsert.
-    Row MUST contain 'id'.
+    Upsert a position row into public.positions.
+    Row MUST contain 'id' and any base fields (symbol, asset_type, occ, qty, avg_cost, etc.)
+
+    Uses Supabase 'upsert' on conflict id.
     """
-    sb.table("positions").upsert(row, on_conflict="id").execute()
+    clean = _sanitize_row(row)
+    sb.table("positions").upsert(clean, on_conflict="id").execute()
     return "upserted"
 
 
 def delete_missing_tradier_positions(current_ids: List[str]) -> None:
     """
     Delete positions whose id starts with 'tradier:' but are not in current_ids.
-    This prevents touching other brokers.
+    This prevents touching other brokers' rows.
     """
     current_set = set(current_ids)
-    # Fetch only Tradier-origin rows (id LIKE 'tradier:%')
+
     res = sb.table("positions").select("id").like("id", "tradier:%").execute()
     rows = res.data or []
+
     for r in rows:
         pid = r["id"]
         if pid not in current_set:
@@ -41,7 +86,7 @@ def delete_missing_tradier_positions(current_ids: List[str]) -> None:
 def fetch_active_tradier_positions() -> List[Dict[str, Any]]:
     """
     Get all non-zero qty positions for Tradier (id like 'tradier:%').
-    Also select generated 'underlier' for options.
+    Also select generated 'underlier' for options so quotes loop can fetch underlier spot.
     """
     res = (
         sb.table("positions")
@@ -54,4 +99,8 @@ def fetch_active_tradier_positions() -> List[Dict[str, Any]]:
 
 
 def update_quote_fields(pid: str, fields: Dict[str, Any]) -> None:
-    sb.table("positions").update(fields).eq("id", pid).execute()
+    """
+    Update mark / prev_close / underlier_spot / last_updated for a given position id.
+    """
+    clean = _sanitize_row(fields)
+    sb.table("positions").update(clean).eq("id", pid).execute()
