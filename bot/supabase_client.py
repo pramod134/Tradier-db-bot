@@ -128,16 +128,22 @@ def delete_missing_tradier_positions(current_ids: List[str]) -> None:
 
 def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
     """
-    Return a unique list of symbols from the spot table that we should
-    compute indicators for.
+    Return a unique list of *underlier* symbols from the spot table that we
+    should compute indicators for.
+
+    We use:
+      - instrument_id  as the raw symbol/underlier
+      - asset_type     to filter out options
+
+    Only rows where asset_type looks like an equity / stock / ETF
+    will be used for Yahoo Finance candles.
     """
     try:
         resp = (
             sb.table("spot")
-            .select("symbol")
-            .not_.is_("symbol", "null")  # avoid nulls
-            .neq("symbol", "")           # avoid empty strings
-            .order("symbol")
+            .select("instrument_id,asset_type")
+            .not_.is_("instrument_id", "null")
+            .neq("instrument_id", "")
             .limit(max_symbols)
             .execute()
         )
@@ -147,13 +153,27 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
 
     data = resp.data or []
     symbols: List[str] = []
+
     for row in data:
-        sym = str(row.get("symbol") or "").upper().strip()
-        if sym and sym not in symbols:
+        raw_sym = row.get("instrument_id")
+        asset_type = (row.get("asset_type") or "").lower()
+
+        if not raw_sym:
+            continue
+
+        # Keep only spot rows that represent actual underliers (stocks/ETFs/etc),
+        # skip options here.
+        if asset_type not in ("equity", "stock", "etf", "underlier"):
+            continue
+
+        sym = str(raw_sym).upper().strip()
+        if not sym:
+            continue
+
+        if sym not in symbols:
             symbols.append(sym)
 
     return symbols
-
 
 def fetch_active_tradier_positions() -> List[Dict[str, Any]]:
     """
