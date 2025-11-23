@@ -9,7 +9,7 @@ from .config import settings
 from .logger import log
 from . import tradier_client
 from . import supabase_client
-from . import yahoo_candles
+from . import market_data
 from . import spot_indicators
 
 
@@ -345,7 +345,7 @@ async def run_spot_indicators_loop() -> None:
                 async with httpx.AsyncClient() as client:
                     for symbol in symbols:
                         try:
-                            candles = await yahoo_candles.fetch_yahoo_candles(
+                            candles = await market_data.fetch_candles(
                                 client,
                                 symbol=symbol,
                                 interval=tf,
