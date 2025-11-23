@@ -177,18 +177,18 @@ def delete_missing_tradier_positions(current_ids: List[str]) -> None:
             log("info", "deleted_stale_position", id=pid)
 
 
-
 def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
     """
     Return a unique list of *underlier* symbols from the spot table that we
     should compute indicators for.
 
-    We use:
-      - instrument_id  as the raw symbol/underlier
-      - asset_type     to filter out options
+    Uses:
+      - instrument_id as the raw symbol/underlier
+      - asset_type to filter out options
 
-    Only rows where asset_type looks like an equity / stock / ETF
-    will be used for Yahoo Finance candles.
+    Only rows where asset_type looks like equity/stock/ETF/underlier
+    will be included. OCC-style option codes are also filtered out
+    using a length+digit heuristic for extra safety.
     """
     try:
         resp = (
@@ -205,6 +205,7 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
 
     data = resp.data or []
     symbols: List[str] = []
+    seen: set[str] = set()
 
     for row in data:
         raw_sym = row.get("instrument_id")
@@ -213,8 +214,7 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
         if not raw_sym:
             continue
 
-        # Keep only spot rows that represent actual underliers (stocks/ETFs/etc),
-        # skip options here.
+        # Only accept real underliers
         if asset_type not in ("equity", "stock", "etf", "underlier"):
             continue
 
@@ -222,10 +222,18 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
         if not sym:
             continue
 
-        if sym not in symbols:
+        # EXTRA SAFETY:
+        # Option OCC symbols are long and contain digits
+        # e.g., AMD240118C00100000
+        if len(sym) > 6 and any(c.isdigit() for c in sym):
+            continue
+
+        if sym not in seen:
+            seen.add(sym)
             symbols.append(sym)
 
     return symbols
+
 
 def fetch_active_tradier_positions() -> List[Dict[str, Any]]:
     """
