@@ -1,4 +1,6 @@
+
 import asyncio
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -14,11 +16,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_float(v: Any) -> Any:
+    try:
+        if v is None:
+            return None
+        f = float(v)
+        if not math.isfinite(f):
+            return None
+        return f
+    except Exception:
+        return None
+
+
 async def run_positions_loop() -> None:
     """
     Periodically sync positions from Tradier SANDBOX into public.positions.
-    - Uses sandbox token + sandbox base URL.
-    - Writes/updates rows whose id starts with 'tradier:{account_id}:{symbol}'.
+
+    NEW: This loop now also fetches LIVE quotes before inserting,
+    so each row in positions is born with mark / prev_close / underlier_spot
+    already filled as best as possible.
     """
     interval = max(3, settings.poll_positions_sec)
     log(
@@ -32,8 +48,8 @@ async def run_positions_loop() -> None:
         start = datetime.now(timezone.utc)
         try:
             async with httpx.AsyncClient() as client:
-                current_ids: List[str] = []
-
+                # 1) Fetch all positions from sandbox first
+                raw_positions: List[Dict[str, Any]] = []
                 for account_id in settings.tradier_sandbox_accounts:
                     positions = await tradier_client.fetch_positions(client, account_id)
                     log(
@@ -42,61 +58,145 @@ async def run_positions_loop() -> None:
                         account_id=account_id,
                         count=len(positions),
                     )
-
                     for p in positions:
-                        sym_raw = str(p.get("symbol", "")).upper()
-                        if not sym_raw:
-                            continue
+                        p["_account_id"] = account_id  # keep for building id later
+                        raw_positions.append(p)
 
-                        qty = int(p.get("quantity", 0) or 0)
-                        cost_basis_total = float(p.get("cost_basis", 0) or 0.0)
+                # If nothing, skip
+                if not raw_positions:
+                    await asyncio.sleep(interval)
+                    continue
 
-                        # Protect against div by zero
-                        avg_cost = cost_basis_total / qty if qty not in (0, 0.0) else None
+                # 2) Build symbol list for quotes (live)
+                symbols_to_quote: List[str] = []
+                # We'll also precompute some metadata for each position
+                enriched: List[Dict[str, Any]] = []
 
-                        # Determine option vs equity
-                        inst = p.get("instrument") or {}
-                        inst_type = str(inst.get("asset_type", "")).lower()
-                        is_option = inst_type == "option" or len(sym_raw) > 15
+                for p in raw_positions:
+                    account_id = p["_account_id"]
+                    sym_raw = str(p.get("symbol", "")).upper()
+                    if not sym_raw:
+                        continue
 
-                        asset_type = "option" if is_option else "equity"
-                        contract_multiplier = 100 if is_option else 1
+                    qty = int(p.get("quantity", 0) or 0)
+                    cost_basis_total = float(p.get("cost_basis", 0) or 0.0)
+                    avg_cost = cost_basis_total / qty if qty not in (0, 0.0) else None
 
-                        # For options we keep symbol = OCC, occ = OCC
-                        symbol = sym_raw
-                        occ = sym_raw if is_option else None
+                    inst = p.get("instrument") or {}
+                    inst_type = str(inst.get("asset_type", "")).lower()
+                    # Treat as option if Tradier says "option" or if it's a long OCC-like symbol
+                    is_option = inst_type == "option" or len(sym_raw) > 15
 
-                        # Build primary key id using sandbox account id
-                        pid = supabase_client.build_tradier_id(account_id, symbol)
+                    asset_type = "option" if is_option else "equity"
+                    contract_multiplier = 100 if is_option else 1
 
-                        row: Dict[str, Any] = {
-                            "id": pid,
-                            "symbol": symbol,
-                            "asset_type": asset_type,
-                            "occ": occ,
-                            "qty": qty,
-                            "avg_cost": avg_cost,
-                            # price fields are filled by quotes loop
-                            "mark": None,
-                            "prev_close": None,
-                            "contract_multiplier": contract_multiplier,
-                            "underlier_spot": None,
-                            "last_updated": _now_iso(),
-                        }
+                    # For options, symbol is OCC, occ = OCC
+                    symbol = sym_raw
+                    occ = sym_raw if is_option else None
 
-                        current_ids.append(pid)
-                        status = supabase_client.upsert_position_row(row)
-                        log(
-                            "info",
-                            "position_upsert",
-                            id=pid,
-                            asset_type=asset_type,
-                            qty=qty,
-                            status=status,
-                            env="sandbox",
+                    # Try to find underlier symbol for options from instrument if present
+                    underlier_symbol = ""
+                    if is_option:
+                        # Tradier often has "underlying" or the underlier in "symbol" field of instrument
+                        underlier_symbol = (
+                            str(inst.get("underlying") or inst.get("symbol") or "")
+                            .upper()
+                            .strip()
                         )
 
-                # Delete sandbox-origin positions that no longer exist at Tradier
+                    # Collect for quotes:
+                    if asset_type == "equity":
+                        symbols_to_quote.append(symbol)  # equity symbol itself
+                    else:
+                        # Option: need both OCC and underlier for spot
+                        symbols_to_quote.append(symbol)  # option quote
+                        if underlier_symbol:
+                            symbols_to_quote.append(underlier_symbol)
+
+                    enriched.append(
+                        {
+                            "account_id": account_id,
+                            "symbol": symbol,
+                            "occ": occ,
+                            "asset_type": asset_type,
+                            "qty": qty,
+                            "avg_cost": avg_cost,
+                            "contract_multiplier": contract_multiplier,
+                            "underlier_symbol": underlier_symbol,
+                        }
+                    )
+
+                # 3) Fetch LIVE quotes for all collected symbols
+                async with httpx.AsyncClient() as live_client:
+                    quotes = await tradier_client.fetch_quotes(live_client, symbols_to_quote)
+
+                # 4) Build fully-populated rows and upsert into positions
+                current_ids: List[str] = []
+
+                for pos in enriched:
+                    account_id = pos["account_id"]
+                    symbol = pos["symbol"]
+                    occ = pos["occ"]
+                    asset_type = pos["asset_type"]
+                    qty = pos["qty"]
+                    avg_cost = pos["avg_cost"]
+                    contract_multiplier = pos["contract_multiplier"]
+                    underlier_symbol = pos["underlier_symbol"]
+
+                    mark = None
+                    prev_close = None
+                    underlier_spot = None
+
+                    if asset_type == "option":
+                        # Option mark from OCC symbol
+                        oq = quotes.get(symbol)
+                        if oq:
+                            mark = oq.get("last") or oq.get("close")
+                            prev_close = oq.get("prevclose")
+
+                        # Underlier spot from underlying symbol, if we have it
+                        if underlier_symbol:
+                            uq = quotes.get(underlier_symbol)
+                            if uq:
+                                underlier_spot = uq.get("last") or uq.get("close")
+                    else:
+                        # Equity: mark and spot from same symbol
+                        sq = quotes.get(symbol)
+                        if sq:
+                            mark = sq.get("last") or sq.get("close")
+                            prev_close = sq.get("prevclose")
+                            underlier_spot = mark
+
+                    # Build primary key id
+                    pid = supabase_client.build_tradier_id(account_id, symbol)
+
+                    row: Dict[str, Any] = {
+                        "id": pid,
+                        "symbol": symbol,
+                        "asset_type": asset_type,
+                        "occ": occ,
+                        "qty": qty,
+                        "avg_cost": _safe_float(avg_cost),
+                        "mark": _safe_float(mark),
+                        "prev_close": _safe_float(prev_close),
+                        "contract_multiplier": contract_multiplier,
+                        "underlier_spot": _safe_float(underlier_spot),
+                        "last_updated": _now_iso(),
+                    }
+
+                    current_ids.append(pid)
+                    status = supabase_client.upsert_position_row(row)
+                    log(
+                        "info",
+                        "position_upsert",
+                        id=pid,
+                        asset_type=asset_type,
+                        qty=qty,
+                        status=status,
+                        env="sandbox+live",
+                    )
+
+                # 5) Delete sandbox-origin positions that no longer exist
                 supabase_client.delete_missing_tradier_positions(current_ids)
 
         except Exception as e:
@@ -114,8 +214,8 @@ async def run_quotes_loop() -> None:
     - prev_close
     - underlier_spot
 
-    Positions may come from sandbox, but quotes are from live env
-    via tradier_client.fetch_quotes().
+    This now acts as a refresher: positions are initially born with quotes
+    in the positions loop, and this loop keeps them up to date.
     """
     interval = max(2, settings.poll_quotes_sec)
     log("info", "quotes_loop_start", interval=interval)
@@ -133,17 +233,14 @@ async def run_quotes_loop() -> None:
                 symbol = str(r.get("symbol", "")).upper()
                 underlier = str(r.get("underlier") or "").upper()
 
-                # Always quote the main symbol (stock or OCC)
                 if symbol:
                     symbols_to_quote.append(symbol)
-                # For options also quote the underlier if present
                 if underlier:
                     symbols_to_quote.append(underlier)
 
             async with httpx.AsyncClient() as client:
                 quotes = await tradier_client.fetch_quotes(client, symbols_to_quote)
 
-            # Update each position with live marks
             for r in active:
                 pid = r["id"]
                 symbol = str(r.get("symbol", "")).upper()
@@ -155,20 +252,16 @@ async def run_quotes_loop() -> None:
                 underlier_spot = None
 
                 if asset_type == "option":
-                    # Option quote from OCC symbol
                     oq = quotes.get(symbol)
                     if oq:
                         mark = oq.get("last") or oq.get("close")
                         prev_close = oq.get("prevclose")
 
-                    # Underlier quote from parsed underlier symbol
                     if underlier:
                         uq = quotes.get(underlier)
                         if uq:
                             underlier_spot = uq.get("last") or uq.get("close")
-
                 else:
-                    # Equity: symbol is the stock itself
                     sq = quotes.get(symbol)
                     if sq:
                         mark = sq.get("last") or sq.get("close")
@@ -176,9 +269,9 @@ async def run_quotes_loop() -> None:
                         underlier_spot = mark
 
                 fields: Dict[str, Any] = {
-                    "mark": mark,
-                    "prev_close": prev_close,
-                    "underlier_spot": underlier_spot,
+                    "mark": _safe_float(mark),
+                    "prev_close": _safe_float(prev_close),
+                    "underlier_spot": _safe_float(underlier_spot),
                     "last_updated": _now_iso(),
                 }
                 supabase_client.update_quote_fields(pid, fields)
