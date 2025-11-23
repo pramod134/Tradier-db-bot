@@ -125,6 +125,36 @@ def delete_missing_tradier_positions(current_ids: List[str]) -> None:
             log("info", "deleted_stale_position", id=pid)
 
 
+
+def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
+    """
+    Return a unique list of symbols from the spot table that we should
+    compute indicators for.
+    """
+    try:
+        resp = (
+            sb.table("spot")
+            .select("symbol")
+            .not_.is_("symbol", "null")  # avoid nulls
+            .neq("symbol", "")           # avoid empty strings
+            .order("symbol")
+            .limit(max_symbols)
+            .execute()
+        )
+    except Exception as e:
+        log("error", "supabase_fetch_spot_symbols_error", error=str(e))
+        return []
+
+    data = resp.data or []
+    symbols: List[str] = []
+    for row in data:
+        sym = str(row.get("symbol") or "").upper().strip()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+
+    return symbols
+
+
 def fetch_active_tradier_positions() -> List[Dict[str, Any]]:
     """
     Get all non-zero qty positions for Tradier (id like 'tradier:%').
