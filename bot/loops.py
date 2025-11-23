@@ -10,6 +10,8 @@ from .config import settings
 from .logger import log
 from . import tradier_client
 from . import supabase_client
+from . import yahoo_candles
+from . import spot_indicators
 
 
 def _now_iso() -> str:
@@ -280,6 +282,86 @@ async def run_quotes_loop() -> None:
 
         except Exception as e:
             log("error", "quotes_loop_error", error=str(e))
+
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        sleep_for = max(0, interval - elapsed)
+        await asyncio.sleep(sleep_for)
+
+
+async def run_spot_indicators_loop() -> None:
+    """
+    Periodically compute indicator snapshots (swings, FVG, liquidity, volume profile, trend)
+    for each symbol in the spot table, for the timeframes:
+    - 5m  (scalp-ish)
+    - 15m (day)
+    - 1h  (day)
+    - 1d  (swing)
+    And store them in the spot_tf table.
+    """
+    interval = max(60, settings.poll_spot_tf_sec)  # at least 1 minute
+    log("info", "spot_indicators_loop_start", interval=interval)
+
+    timeframes = [
+        ("5m", "scalp"),
+        ("15m", "day"),
+        ("1h", "day"),
+        ("1d", "swing"),
+    ]
+
+    while True:
+        start = datetime.now(timezone.utc)
+        try:
+            symbols = supabase_client.fetch_spot_symbols_for_indicators()
+            if not symbols:
+                log("info", "spot_indicators_no_symbols")
+            else:
+                log("info", "spot_indicators_symbols", count=len(symbols), symbols=symbols)
+
+                async with httpx.AsyncClient() as client:
+                    for symbol in symbols:
+                        for tf, use_case in timeframes:
+                            try:
+                                candles = await yahoo_candles.fetch_yahoo_candles(
+                                    client, symbol=symbol, interval=tf, lookback=500
+                                )
+                                if len(candles) < 30:
+                                    # not enough data for meaningful indicators
+                                    log(
+                                        "info",
+                                        "spot_indicators_not_enough_candles",
+                                        symbol=symbol,
+                                        timeframe=tf,
+                                        count=len(candles),
+                                    )
+                                    continue
+
+                                snapshot = spot_indicators.compute_spot_snapshot(
+                                    candles=candles,
+                                    timeframe=tf,
+                                    use_case=use_case,
+                                    fractal=2,
+                                )
+
+                                supabase_client.upsert_spot_tf_row(symbol, snapshot)
+                                log(
+                                    "info",
+                                    "spot_indicators_upserted",
+                                    symbol=symbol,
+                                    timeframe=tf,
+                                    use_case=use_case,
+                                )
+
+                            except Exception as inner_e:
+                                log(
+                                    "error",
+                                    "spot_indicators_symbol_tf_error",
+                                    symbol=symbol,
+                                    timeframe=tf,
+                                    error=str(inner_e),
+                                )
+
+        except Exception as e:
+            log("error", "spot_indicators_loop_error", error=str(e))
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         sleep_for = max(0, interval - elapsed)
