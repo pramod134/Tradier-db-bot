@@ -50,6 +50,7 @@ sb: Client = create_client(settings.supabase_url, settings.supabase_key)
 def upsert_spot_tf_row(symbol: str, snapshot: Dict[str, Any]) -> None:
     """
     Upsert one row into spot_tf for given symbol + timeframe + use_case.
+
     snapshot must include:
       - timeframe
       - use_case
@@ -61,10 +62,14 @@ def upsert_spot_tf_row(symbol: str, snapshot: Dict[str, Any]) -> None:
       - trend
       - extras
     """
+    timeframe = snapshot["timeframe"]
+    use_case = snapshot.get("use_case", "generic")
+
+    # Build the payload we want to store
     row: Dict[str, Any] = {
         "symbol": symbol,
-        "timeframe": snapshot["timeframe"],
-        "use_case": snapshot.get("use_case", "generic"),
+        "timeframe": timeframe,
+        "use_case": use_case,
         "structure_state": snapshot.get("structure_state", "unknown"),
         "swings": snapshot.get("swings", {}),
         "fvgs": snapshot.get("fvgs", []),
@@ -75,14 +80,61 @@ def upsert_spot_tf_row(symbol: str, snapshot: Dict[str, Any]) -> None:
         "last_updated": snapshot.get("last_updated"),  # optional override
     }
 
-    # Remove None so Supabase can fill default last_updated if we don't pass it
+    # Strip Nones so Supabase can use defaults
     row = {k: v for k, v in row.items() if v is not None}
 
     try:
+        # 1) Fetch existing row (if any) so we can skip if nothing changed
+        resp = (
+            sb.table("spot_tf")
+            .select(
+                "structure_state,swings,fvgs,liquidity,volume_profile,trend,extras"
+            )
+            .eq("symbol", symbol)
+            .eq("timeframe", timeframe)
+            .eq("use_case", use_case)
+            .execute()
+        )
+
+        existing_rows = getattr(resp, "data", None) or []
+        existing = existing_rows[0] if existing_rows else None
+
+        if existing:
+            # Only compare the indicator payload fields
+            keys = [
+                "structure_state",
+                "swings",
+                "fvgs",
+                "liquidity",
+                "volume_profile",
+                "trend",
+                "extras",
+            ]
+            unchanged = all(existing.get(k) == row.get(k) for k in keys)
+            if unchanged:
+                # Nothing meaningful changed – skip the upsert
+                log(
+                    "info",
+                    "spot_indicators_skipped_no_change",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    use_case=use_case,
+                )
+                return
+
+        # 2) Actually upsert when there is a change or no existing row
         sb.table("spot_tf").upsert(row, on_conflict="symbol,timeframe,use_case").execute()
+
     except Exception as e:
-        log("error", "supabase_spot_tf_upsert_error", symbol=symbol, snapshot=row, error=str(e))
+        log(
+            "error",
+            "supabase_spot_tf_upsert_error",
+            symbol=symbol,
+            snapshot=row,
+            error=str(e),
+        )
         raise
+
 
 def build_tradier_id(account_id: str, symbol: str) -> str:
     """
