@@ -349,7 +349,7 @@ async def run_spot_indicators_loop() -> None:
                                 client,
                                 symbol=symbol,
                                 interval=tf,
-                                lookback=500,
+                                limit=1000,
                             )
                             if len(candles) < 30:
                                 log(
