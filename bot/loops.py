@@ -287,43 +287,48 @@ async def run_quotes_loop() -> None:
         await asyncio.sleep(sleep_for)
 
 
-
-
 async def run_spot_indicators_loop() -> None:
     """
-    Polygon Basic mode:
+    Polygon Basic–friendly mode:
 
-    - Run once per minute (interval = 60)
-    - For each cycle:
-        - Fetch up to 1 symbol from spot table
-        - For that symbol, fetch all 4 timeframes:
+    - Run every 30 seconds.
+    - Each cycle:
+        - Pick ONE timeframe from a rotating list:
             5m  (scalp)
             15m (day)
             1h  (day)
             1d  (swing)
-    - This makes 4 aggregate calls per minute, which is safe
-      under Polygon Basic's 5 calls/min rate limit.
+        - Fetch candles for ONE symbol for that timeframe.
+        - Compute indicators and upsert into spot_tf.
+    - Result:
+        - ~2 aggregate calls per minute from the bot.
+        - Each timeframe refreshed about every 2 minutes.
+        - Plenty of buffer under a 5 calls/min rate limit.
     """
-    # Hard override to 60s so we never exceed 5 calls/min with 1 symbol * 4 TF
-    interval = 60
+    # 30 seconds between cycles → ~2 calls/min
+    interval = 30
 
-    timeframes = [
+    tf_cycle = [
         ("5m", "scalp"),
         ("15m", "day"),
         ("1h", "day"),
         ("1d", "swing"),
     ]
+    tf_index = 0
 
-    # Small pause between timeframes, just to be gentle with the API
-    PER_REQUEST_DELAY_SEC = 0.2
+    PER_REQUEST_DELAY_SEC = 0.0  # only 1 request per cycle
 
     log("info", "spot_indicators_loop_start", interval=interval)
 
     while True:
         start = datetime.now(timezone.utc)
 
+        # Rotate timeframe each cycle
+        tf, use_case = tf_cycle[tf_index]
+        tf_index = (tf_index + 1) % len(tf_cycle)
+
         try:
-            # Only one symbol per cycle in Polygon Basic mode
+            # Only one symbol per cycle to keep load tiny
             symbols = supabase_client.fetch_spot_symbols_for_indicators(max_symbols=1)
 
             if not symbols:
@@ -335,30 +340,28 @@ async def run_spot_indicators_loop() -> None:
                     "info",
                     "spot_indicators_symbol_cycle",
                     symbol=symbol,
-                    timeframes=[tf for tf, _ in timeframes],
+                    timeframe=tf,
+                    use_case=use_case,
                 )
 
                 async with httpx.AsyncClient() as client:
-                    for tf, use_case in timeframes:
-                        try:
-                            candles = await market_data.fetch_candles(
-                                client,
+                    try:
+                        candles = await market_data.fetch_candles(
+                            client,
+                            symbol=symbol,
+                            interval=tf,
+                            limit=1000,
+                        )
+
+                        if len(candles) < 30:
+                            log(
+                                "info",
+                                "spot_indicators_not_enough_candles",
                                 symbol=symbol,
-                                interval=tf,
-                                limit=1000,
+                                timeframe=tf,
+                                count=len(candles),
                             )
-
-                            if len(candles) < 30:
-                                log(
-                                    "info",
-                                    "spot_indicators_not_enough_candles",
-                                    symbol=symbol,
-                                    timeframe=tf,
-                                    count=len(candles),
-                                )
-                                await asyncio.sleep(PER_REQUEST_DELAY_SEC)
-                                continue
-
+                        else:
                             snapshot = spot_indicators.compute_spot_snapshot(
                                 candles,
                                 timeframe=tf,
@@ -375,28 +378,31 @@ async def run_spot_indicators_loop() -> None:
                                 use_case=use_case,
                             )
 
+                        if PER_REQUEST_DELAY_SEC > 0:
                             await asyncio.sleep(PER_REQUEST_DELAY_SEC)
 
-                        except httpx.HTTPStatusError as exc:
-                            status = exc.response.status_code
-                            log(
-                                "error",
-                                "spot_indicators_http_error",
-                                symbol=symbol,
-                                timeframe=tf,
-                                status=status,
-                                detail=str(exc),
-                            )
+                    except httpx.HTTPStatusError as exc:
+                        status = exc.response.status_code
+                        log(
+                            "error",
+                            "spot_indicators_http_error",
+                            symbol=symbol,
+                            timeframe=tf,
+                            status=status,
+                            detail=str(exc),
+                        )
+                        if PER_REQUEST_DELAY_SEC > 0:
                             await asyncio.sleep(PER_REQUEST_DELAY_SEC)
 
-                        except Exception as inner_e:
-                            log(
-                                "error",
-                                "spot_indicators_symbol_tf_error",
-                                symbol=symbol,
-                                timeframe=tf,
-                                error=str(inner_e),
-                            )
+                    except Exception as inner_e:
+                        log(
+                            "error",
+                            "spot_indicators_symbol_tf_error",
+                            symbol=symbol,
+                            timeframe=tf,
+                            error=str(inner_e),
+                        )
+                        if PER_REQUEST_DELAY_SEC > 0:
                             await asyncio.sleep(PER_REQUEST_DELAY_SEC)
 
         except Exception as e:
@@ -404,6 +410,5 @@ async def run_spot_indicators_loop() -> None:
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         await asyncio.sleep(max(0, interval - elapsed))
-
 
 
