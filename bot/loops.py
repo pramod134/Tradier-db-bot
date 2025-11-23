@@ -1,4 +1,3 @@
-
 import asyncio
 import math
 from datetime import datetime, timezone
@@ -291,14 +290,22 @@ async def run_quotes_loop() -> None:
 async def run_spot_indicators_loop() -> None:
     """
     Periodically compute indicator snapshots (swings, FVG, liquidity, volume profile, trend)
-    for each symbol in the spot table, for the timeframes:
-    - 5m  (scalp-ish)
-    - 15m (day)
-    - 1h  (day)
-    - 1d  (swing)
+    for each *underlier* symbol in the spot table, for these timeframes:
+
+      - 5m  (use_case='scalp')
+      - 15m (use_case='day')
+      - 1h  (use_case='day')
+      - 1d  (use_case='swing')
+
     And store them in the spot_tf table.
+
+    We throttle requests so we don't hit Yahoo 429:
+      - limit number of symbols per cycle
+      - small delay between calls
+      - back off for a full interval if 429 occurs
     """
-    interval = max(60, settings.poll_spot_tf_sec)  # at least 1 minute
+    # At least 5 minutes between full indicator runs
+    interval = max(300, settings.poll_spot_tf_sec)
     log("info", "spot_indicators_loop_start", interval=interval)
 
     timeframes = [
@@ -308,24 +315,43 @@ async def run_spot_indicators_loop() -> None:
         ("1d", "swing"),
     ]
 
+    # How many symbols to process per cycle (to avoid hammering Yahoo)
+    MAX_SYMBOLS_PER_CYCLE = 5
+    # Small pause between each Yahoo request
+    PER_REQUEST_DELAY_SEC = 0.5
+
     while True:
         start = datetime.now(timezone.utc)
         try:
-            symbols = supabase_client.fetch_spot_symbols_for_indicators()
+            symbols = supabase_client.fetch_spot_symbols_for_indicators(
+                max_symbols=MAX_SYMBOLS_PER_CYCLE
+            )
             if not symbols:
                 log("info", "spot_indicators_no_symbols")
             else:
-                log("info", "spot_indicators_symbols", count=len(symbols), symbols=symbols)
+                log(
+                    "info",
+                    "spot_indicators_symbols",
+                    count=len(symbols),
+                    symbols=symbols,
+                )
 
                 async with httpx.AsyncClient() as client:
+                    rate_limited = False
+
                     for symbol in symbols:
+                        if rate_limited:
+                            break
+
                         for tf, use_case in timeframes:
                             try:
                                 candles = await yahoo_candles.fetch_yahoo_candles(
-                                    client, symbol=symbol, interval=tf, lookback=500
+                                    client,
+                                    symbol=symbol,
+                                    interval=tf,
+                                    lookback=500,
                                 )
                                 if len(candles) < 30:
-                                    # not enough data for meaningful indicators
                                     log(
                                         "info",
                                         "spot_indicators_not_enough_candles",
@@ -333,6 +359,8 @@ async def run_spot_indicators_loop() -> None:
                                         timeframe=tf,
                                         count=len(candles),
                                     )
+                                    # Still delay a bit to be kind
+                                    await asyncio.sleep(PER_REQUEST_DELAY_SEC)
                                     continue
 
                                 snapshot = spot_indicators.compute_spot_snapshot(
@@ -351,6 +379,35 @@ async def run_spot_indicators_loop() -> None:
                                     use_case=use_case,
                                 )
 
+                                # Throttle between calls
+                                await asyncio.sleep(PER_REQUEST_DELAY_SEC)
+
+                            except httpx.HTTPStatusError as exc:
+                                status = exc.response.status_code
+                                if status == 429:
+                                    # Rate limited by Yahoo – back off for the rest of this cycle
+                                    log(
+                                        "error",
+                                        "spot_indicators_rate_limited",
+                                        symbol=symbol,
+                                        timeframe=tf,
+                                        status=status,
+                                        detail=str(exc),
+                                    )
+                                    rate_limited = True
+                                    break
+                                else:
+                                    log(
+                                        "error",
+                                        "spot_indicators_http_error",
+                                        symbol=symbol,
+                                        timeframe=tf,
+                                        status=status,
+                                        detail=str(exc),
+                                    )
+                                    # brief pause anyway
+                                    await asyncio.sleep(PER_REQUEST_DELAY_SEC)
+
                             except Exception as inner_e:
                                 log(
                                     "error",
@@ -359,10 +416,12 @@ async def run_spot_indicators_loop() -> None:
                                     timeframe=tf,
                                     error=str(inner_e),
                                 )
+                                await asyncio.sleep(PER_REQUEST_DELAY_SEC)
 
         except Exception as e:
             log("error", "spot_indicators_loop_error", error=str(e))
 
+        # Sleep until next cycle
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         sleep_for = max(0, interval - elapsed)
         await asyncio.sleep(sleep_for)
