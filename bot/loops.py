@@ -287,63 +287,59 @@ async def run_quotes_loop() -> None:
         await asyncio.sleep(sleep_for)
 
 
+
+
 async def run_spot_indicators_loop() -> None:
     """
-    Periodically compute indicator snapshots (swings, FVG, liquidity, volume profile, trend)
-    for each *underlier* symbol in the spot table.
+    Polygon Basic mode:
 
-    To avoid Yahoo 429:
-      - process only a few symbols per cycle
-      - only 1 timeframe per cycle (rotating through 5m, 15m, 1h, 1d)
-      - small delay between calls
+    - Run once per minute (interval = 60)
+    - For each cycle:
+        - Fetch up to 1 symbol from spot table
+        - For that symbol, fetch all 4 timeframes:
+            5m  (scalp)
+            15m (day)
+            1h  (day)
+            1d  (swing)
+    - This makes 4 aggregate calls per minute, which is safe
+      under Polygon Basic's 5 calls/min rate limit.
     """
-    # Use poll_spot_tf_sec if defined in settings, else default to 900s (15 minutes),
-    # and never less than 300s (5 minutes).
-    raw_interval = getattr(settings, "poll_spot_tf_sec", 900)
-    try:
-        raw_interval = int(raw_interval)
-    except Exception:
-        raw_interval = 900
-    interval = max(300, raw_interval)
+    # Hard override to 60s so we never exceed 5 calls/min with 1 symbol * 4 TF
+    interval = 60
 
-    log("info", "spot_indicators_loop_start", interval=interval)
-
-    # We will rotate through these timeframes across cycles
-    tf_cycle = [
+    timeframes = [
         ("5m", "scalp"),
         ("15m", "day"),
         ("1h", "day"),
         ("1d", "swing"),
     ]
-    tf_index = 0  # local cycle pointer
 
-    MAX_SYMBOLS_PER_CYCLE = 3
-    PER_REQUEST_DELAY_SEC = 1.0  # 1 second between calls
+    # Small pause between timeframes, just to be gentle with the API
+    PER_REQUEST_DELAY_SEC = 0.2
+
+    log("info", "spot_indicators_loop_start", interval=interval)
 
     while True:
         start = datetime.now(timezone.utc)
 
-        tf, use_case = tf_cycle[tf_index]
-        tf_index = (tf_index + 1) % len(tf_cycle)
-
         try:
-            symbols = supabase_client.fetch_spot_symbols_for_indicators(
-                max_symbols=MAX_SYMBOLS_PER_CYCLE
-            )
+            # Only one symbol per cycle in Polygon Basic mode
+            symbols = supabase_client.fetch_spot_symbols_for_indicators(max_symbols=1)
+
             if not symbols:
                 log("info", "spot_indicators_no_symbols")
             else:
+                symbol = symbols[0]
+
                 log(
                     "info",
-                    "spot_indicators_symbols",
-                    timeframe=tf,
-                    use_case=use_case,
-                    count=len(symbols),
-                    symbols=symbols,
+                    "spot_indicators_symbol_cycle",
+                    symbol=symbol,
+                    timeframes=[tf for tf, _ in timeframes],
                 )
 
                 async with httpx.AsyncClient() as client:
-                    for symbol in symbols:
+                    for tf, use_case in timeframes:
                         try:
                             candles = await market_data.fetch_candles(
                                 client,
@@ -351,6 +347,7 @@ async def run_spot_indicators_loop() -> None:
                                 interval=tf,
                                 limit=1000,
                             )
+
                             if len(candles) < 30:
                                 log(
                                     "info",
@@ -363,13 +360,13 @@ async def run_spot_indicators_loop() -> None:
                                 continue
 
                             snapshot = spot_indicators.compute_spot_snapshot(
-                                candles=candles,
+                                candles,
                                 timeframe=tf,
                                 use_case=use_case,
                                 fractal=2,
                             )
-
                             supabase_client.upsert_spot_tf_row(symbol, snapshot)
+
                             log(
                                 "info",
                                 "spot_indicators_upserted",
@@ -382,27 +379,15 @@ async def run_spot_indicators_loop() -> None:
 
                         except httpx.HTTPStatusError as exc:
                             status = exc.response.status_code
-                            if status == 429:
-                                log(
-                                    "error",
-                                    "spot_indicators_rate_limited",
-                                    symbol=symbol,
-                                    timeframe=tf,
-                                    status=status,
-                                    detail=str(exc),
-                                )
-                                # On 429, break this cycle and try again next interval
-                                break
-                            else:
-                                log(
-                                    "error",
-                                    "spot_indicators_http_error",
-                                    symbol=symbol,
-                                    timeframe=tf,
-                                    status=status,
-                                    detail=str(exc),
-                                )
-                                await asyncio.sleep(PER_REQUEST_DELAY_SEC)
+                            log(
+                                "error",
+                                "spot_indicators_http_error",
+                                symbol=symbol,
+                                timeframe=tf,
+                                status=status,
+                                detail=str(exc),
+                            )
+                            await asyncio.sleep(PER_REQUEST_DELAY_SEC)
 
                         except Exception as inner_e:
                             log(
@@ -418,5 +403,7 @@ async def run_spot_indicators_loop() -> None:
             log("error", "spot_indicators_loop_error", error=str(e))
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        sleep_for = max(0, interval - elapsed)
-        await asyncio.sleep(sleep_for)
+        await asyncio.sleep(max(0, interval - elapsed))
+
+
+
