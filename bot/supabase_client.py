@@ -7,6 +7,42 @@ from supabase import Client, create_client
 from .config import settings
 from .logger import log
 
+def upsert_spot_tf_row(symbol: str, snapshot: Dict[str, Any]) -> None:
+    """
+    Upsert one row into spot_tf for given symbol + timeframe + use_case.
+    snapshot must include:
+      - timeframe
+      - use_case
+      - structure_state
+      - swings
+      - fvgs
+      - liquidity
+      - volume_profile
+      - trend
+      - extras
+    """
+    row: Dict[str, Any] = {
+        "symbol": symbol,
+        "timeframe": snapshot["timeframe"],
+        "use_case": snapshot.get("use_case", "generic"),
+        "structure_state": snapshot.get("structure_state", "unknown"),
+        "swings": snapshot.get("swings", {}),
+        "fvgs": snapshot.get("fvgs", []),
+        "liquidity": snapshot.get("liquidity", {}),
+        "volume_profile": snapshot.get("volume_profile", {}),
+        "trend": snapshot.get("trend", {}),
+        "extras": snapshot.get("extras", {}),
+        "last_updated": snapshot.get("last_updated"),  # optional override
+    }
+
+    # Remove None so Supabase can fill default last_updated if we don't pass it
+    row = {k: v for k, v in row.items() if v is not None}
+
+    try:
+        sb.table("spot_tf").upsert(row, on_conflict="symbol,timeframe,use_case").execute()
+    except Exception as e:
+        log("error", "supabase_spot_tf_upsert_error", symbol=symbol, snapshot=row, error=str(e))
+        raise
 
 # ---------- JSON sanitization helpers ----------
 
