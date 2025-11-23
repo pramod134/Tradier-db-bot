@@ -41,9 +41,17 @@ async def fetch_candles(
 
     # Pull the last few days to always have enough bars
     now = dt.datetime.now(dt.timezone.utc)
-    start_dt = now - dt.timedelta(days=10)
+
+    if interval == "1d":
+        # Pull ~90 calendar days so we comfortably have 30+ trading days
+        start_dt = now - dt.timedelta(days=90)
+    else:
+        # For intraday (5m, 15m, 1h), 10 days is fine
+        start_dt = now - dt.timedelta(days=10)
+
     start = start_dt.date().isoformat()
     end = now.date().isoformat()
+
 
     url = (
         f"{POLYGON_BASE_URL}/v2/aggs/ticker/"
