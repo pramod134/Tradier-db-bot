@@ -12,6 +12,7 @@ from . import supabase_client
 from . import market_data
 from . import spot_indicators
 
+symbol_index_for_indicators = 0
 
 
 
@@ -331,12 +332,20 @@ async def run_spot_indicators_loop() -> None:
 
         try:
             # Only one symbol per cycle to keep load tiny
-            symbols = supabase_client.fetch_spot_symbols_for_indicators(max_symbols=1)
+            global symbol_index_for_indicators
+
+            # Fetch ALL eligible symbols; we'll rotate through them
+            symbols = supabase_client.fetch_spot_symbols_for_indicators()
 
             if not symbols:
                 log("info", "spot_indicators_no_symbols")
             else:
-                symbol = symbols[0]
+                # Rotate index safely
+                symbol_count = len(symbols)
+                symbol_index_for_indicators = symbol_index_for_indicators % symbol_count
+                symbol = symbols[symbol_index_for_indicators]
+                symbol_index_for_indicators += 1  # next cycle will use the next symbol
+
 
                 log(
                     "info",
