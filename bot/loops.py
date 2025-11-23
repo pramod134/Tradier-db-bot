@@ -305,7 +305,14 @@ async def run_spot_indicators_loop() -> None:
       - back off for a full interval if 429 occurs
     """
     # At least 5 minutes between full indicator runs
-    interval = max(300, settings.poll_spot_tf_sec)
+    # Use poll_spot_tf_sec if defined in settings, else default to 900s (15 minutes),
+    # and never less than 300s (5 minutes).
+    raw_interval = getattr(settings, "poll_spot_tf_sec", 900)
+    try:
+        raw_interval = int(raw_interval)
+    except Exception:
+        raw_interval = 900
+    interval = max(300, raw_interval)
     log("info", "spot_indicators_loop_start", interval=interval)
 
     timeframes = [
