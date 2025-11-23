@@ -1,5 +1,6 @@
 # bot/market_data.py
 
+import os
 import datetime as dt
 from typing import Any, Dict, List
 
@@ -15,6 +16,10 @@ _INTERVAL_MAP = {
     "1d": "1Day",
 }
 
+API_KEY_ID = os.getenv("ALPACA_API_KEY_ID")
+API_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY")
+
+
 
 async def fetch_candles(
     client: httpx.AsyncClient,
@@ -22,6 +27,11 @@ async def fetch_candles(
     interval: str = "5m",
     limit: int = 1000,
 ) -> List[Dict[str, Any]]:
+    if not API_KEY_ID or not API_SECRET_KEY:
+        raise RuntimeError(
+            "Alpaca API keys not configured. Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY env vars."
+        )
+    
     """
     Generic candle fetcher for the bot.
 
@@ -46,7 +56,17 @@ async def fetch_candles(
         f"?timeframe={provider_tf}&limit={limit}&adjustment=all"
     )
 
-    resp = await client.get(url, timeout=20)
+    headers = {}
+    if API_KEY_ID and API_SECRET_KEY:
+        headers = {
+            "APCA-API-KEY-ID": API_KEY_ID,
+            "APCA-API-SECRET-KEY": API_SECRET_KEY,
+        }
+    
+    resp = await client.get(url, headers=headers, timeout=20)
+
+
+    
     resp.raise_for_status()
     data = resp.json()
 
