@@ -21,6 +21,8 @@ class Settings:
     poll_positions_sec: int
     poll_quotes_sec: int
 
+    poll_spot_tf_sec: int = int(os.getenv("POLL_SPOT_TF_SEC", "900"))  # 15 minutes default
+
     @classmethod
     def load(cls) -> "Settings":
         return cls(
