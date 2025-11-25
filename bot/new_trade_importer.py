@@ -227,8 +227,9 @@ def _snap_strike_to_tradier_chain(
     Ask Tradier for the option chain for (symbol, expiry_date) and
     snap target_strike to the nearest listed strike.
 
-    If anything fails (no chain, HTTP error, etc.), we just return
-    target_strike unchanged and log the error.
+    If anything fails (no chain, HTTP error, etc.), we fall back to
+    rounding target_strike to the nearest 5 dollars so we at least
+    don't end up with weird decimals like 1165.44.
     """
     base = settings.tradier_live_base.rstrip("/")
     url = f"{base}/v1/markets/options/chains"
@@ -239,13 +240,14 @@ def _snap_strike_to_tradier_chain(
         "greeks": "false",
     }
 
-    # Adjust this if your settings uses a different env var name
     headers = {
         "Authorization": f"Bearer {settings.tradier_live_token}",
         "Accept": "application/json",
     }
 
     try:
+        import httpx
+
         with httpx.Client(timeout=5.0) as client:
             resp = client.get(url, params=params, headers=headers)
             resp.raise_for_status()
@@ -259,32 +261,50 @@ def _snap_strike_to_tradier_chain(
             if s is not None:
                 strikes.append(s)
 
-        if not strikes:
-            return target_strike
+        if strikes:
+            nearest = min(strikes, key=lambda s: abs(s - target_strike))
+            log(
+                "info",
+                "nt_import_strike_snap",
+                symbol=symbol.upper(),
+                expiry=expiry_date.isoformat(),
+                target=target_strike,
+                snapped=nearest,
+            )
+            return nearest
 
-        nearest = min(strikes, key=lambda s: abs(s - target_strike))
-
+        # fall through to rounding fallback if no strikes
         log(
-            "info",
-            "nt_import_strike_snap",
+            "error",
+            "nt_import_chain_empty",
             symbol=symbol.upper(),
             expiry=expiry_date.isoformat(),
             target=target_strike,
-            snapped=nearest,
         )
 
-        return nearest
-
     except Exception as e:
+        # network / auth / parsing error → log and use rounding fallback
         log(
             "error",
             "nt_import_chain_snap_error",
             symbol=symbol.upper(),
             expiry=expiry_date.isoformat(),
-            target_strike=target_strike,
+            target=target_strike,
             error=str(e),
         )
-        return target_strike
+
+    # ---- Fallback: round to nearest $5 ----
+    rounded = round(target_strike / 5.0) * 5.0
+    log(
+        "info",
+        "nt_import_strike_round_fallback",
+        symbol=symbol.upper(),
+        expiry=expiry_date.isoformat(),
+        target=target_strike,
+        rounded=rounded,
+    )
+    return rounded
+
 
 
 def _compute_option_strike_and_expiry(
