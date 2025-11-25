@@ -232,7 +232,9 @@ def _snap_strike_to_tradier_chain(
     don't end up with weird decimals like 1165.44.
     """
     base = settings.tradier_live_base.rstrip("/")
-    url = f"{base}/v1/markets/options/chains"
+    
+    url = f"{base}/markets/options/chains"
+
 
     params = {
         "symbol": (symbol or "").upper(),
