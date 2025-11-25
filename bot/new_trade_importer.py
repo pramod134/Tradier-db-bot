@@ -176,7 +176,7 @@ def _build_occ(symbol: str, expiry_date: datetime.date, cp_dir: str, strike: flo
     Format:
       ROOT(6) + YY + MM + DD + C/P + STRIKE(8, strike * 1000)
     """
-    root = (symbol or "").upper().ljust(6)[:6]
+    root = (symbol or "").upper().strip()
     yy = expiry_date.year % 100
     mm = expiry_date.month
     dd = expiry_date.day
