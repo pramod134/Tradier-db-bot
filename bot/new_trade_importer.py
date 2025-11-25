@@ -1,8 +1,6 @@
-# bot/new_trade_importer.py
-
 import asyncio
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -15,10 +13,17 @@ from . import tradier_client
 
 # ---------- Supabase client (local to this module) ----------
 
-sb: Client = create_client(settings.supabase_url, settings.supabase_key)
+_sb: Client | None = None
 
 
-# ---------- Helpers ----------
+def get_client() -> Client:
+    global _sb
+    if _sb is None:
+        _sb = create_client(settings.supabase_url, settings.supabase_key)
+    return _sb
+
+
+# ---------- Generic helpers ----------
 
 def _safe_float(v: Any) -> Optional[float]:
     try:
@@ -30,52 +35,6 @@ def _safe_float(v: Any) -> Optional[float]:
         return f
     except Exception:
         return None
-
-def _snap_strike_to_tradier_chain(symbol: str, expiry_date, target_strike: float) -> float:
-    base = settings.tradier_live_base.rstrip("/")
-    url = f"{base}/v1/markets/options/chains"
-
-    params = {
-        "symbol": symbol.upper(),
-        "expiration": expiry_date.isoformat(),
-        "greeks": "false",
-    }
-
-    headers = {
-        "Authorization": f"Bearer {settings.tradier_live_token}",
-        "Accept": "application/json",
-    }
-
-    try:
-        with httpx.Client(timeout=5.0) as client:
-            resp = client.get(url, params=params, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-
-        options = (data.get("options") or {}).get("option") or []
-        strikes = []
-
-        for opt in options:
-            s = _safe_float(opt.get("strike"))
-            if s is not None:
-                strikes.append(s)
-
-        if not strikes:
-            return target_strike
-
-        nearest = min(strikes, key=lambda s: abs(s - target_strike))
-        return nearest
-
-    except Exception as e:
-        log(
-            "error",
-            "nt_import_chain_snap_error",
-            symbol=symbol,
-            expiry=expiry_date.isoformat(),
-            target_strike=target_strike,
-            error=str(e),
-        )
-        return target_strike
 
 
 def _now_iso() -> str:
@@ -108,6 +67,15 @@ def _parse_cp(raw: Any) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _parse_trade_type(raw: Any) -> str:
+    s = (raw or "").strip().lower()
+    if not s:
+        return "swing"
+    return s
+
+
+# ---------- Underlier spot helpers ----------
+
 async def _get_underlier_spot(
     client: httpx.AsyncClient,
     symbol: str,
@@ -121,6 +89,7 @@ async def _get_underlier_spot(
     2) If missing, retry a few times via Tradier live quotes.
     3) If still missing, return None (caller will skip this trade).
     """
+    sb = get_client()
     symbol_u = (symbol or "").upper()
     if not symbol_u:
         return None
@@ -180,11 +149,14 @@ async def _get_underlier_spot(
     return None
 
 
+# ---------- Defaults helpers ----------
+
 def _fetch_trade_defaults(asset_type: str, trade_type: str) -> Optional[Dict[str, Any]]:
     """
     Load a single row from trade_defaults for given asset_type + trade_type.
     We expect you have global defaults (symbol IS NULL).
     """
+    sb = get_client()
     try:
         resp = (
             sb.table("trade_defaults")
@@ -215,7 +187,9 @@ def _fetch_trade_defaults(asset_type: str, trade_type: str) -> Optional[Dict[str
         return None
 
 
-def _build_occ(symbol: str, expiry_date: datetime.date, cp_dir: str, strike: float) -> str:
+# ---------- Option helpers (OCC, chain snap) ----------
+
+def _build_occ(symbol: str, expiry_date: date, cp_dir: str, strike: float) -> str:
     """
     Build an OCC-style option symbol in Tradier format, e.g.:
 
@@ -228,7 +202,6 @@ def _build_occ(symbol: str, expiry_date: datetime.date, cp_dir: str, strike: flo
       C/P +
       STRIKE (8 digits = round(strike * 1000))
     """
-    # ROOT: just the ticker, uppercased, no padding spaces
     root = (symbol or "").upper().strip()
 
     yy = expiry_date.year % 100
@@ -245,12 +218,158 @@ def _build_occ(symbol: str, expiry_date: datetime.date, cp_dir: str, strike: flo
     return f"{root}{yy:02d}{mm:02d}{dd:02d}{cp_letter}{strike_code}"
 
 
-def _parse_trade_type(raw: Any) -> str:
-    s = (raw or "").strip().lower()
-    if not s:
-        return "swing"
-    return s
+def _snap_strike_to_tradier_chain(
+    symbol: str,
+    expiry_date: date,
+    target_strike: float,
+) -> float:
+    """
+    Ask Tradier for the option chain for (symbol, expiry_date) and
+    snap target_strike to the nearest listed strike.
 
+    If anything fails (no chain, HTTP error, etc.), we just return
+    target_strike unchanged and log the error.
+    """
+    base = settings.tradier_live_base.rstrip("/")
+    url = f"{base}/v1/markets/options/chains"
+
+    params = {
+        "symbol": (symbol or "").upper(),
+        "expiration": expiry_date.strftime("%Y-%m-%d"),
+        "greeks": "false",
+    }
+
+    # Adjust this if your settings uses a different env var name
+    headers = {
+        "Authorization": f"Bearer {settings.tradier_live_token}",
+        "Accept": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        options = (data.get("options") or {}).get("option") or []
+        strikes: List[float] = []
+
+        for opt in options:
+            s = _safe_float(opt.get("strike"))
+            if s is not None:
+                strikes.append(s)
+
+        if not strikes:
+            return target_strike
+
+        nearest = min(strikes, key=lambda s: abs(s - target_strike))
+
+        log(
+            "info",
+            "nt_import_strike_snap",
+            symbol=symbol.upper(),
+            expiry=expiry_date.isoformat(),
+            target=target_strike,
+            snapped=nearest,
+        )
+
+        return nearest
+
+    except Exception as e:
+        log(
+            "error",
+            "nt_import_chain_snap_error",
+            symbol=symbol.upper(),
+            expiry=expiry_date.isoformat(),
+            target_strike=target_strike,
+            error=str(e),
+        )
+        return target_strike
+
+
+def _compute_option_strike_and_expiry(
+    row: Dict[str, Any],
+    defaults: Dict[str, Any],
+    spot_price: float,
+    cp_dir: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Determine strike, expiry, and occ for an option row.
+
+    - If row provides strike/expiry/occ, we respect them.
+    - Otherwise we use:
+        - expiry_weeks: ~N weeks out
+        - strike_offset_pct: e.g. 5%
+      and then SNAP the strike to the nearest listed strike from
+      Tradier's option chain (if available).
+    """
+    symbol = (row.get("symbol") or "").upper()
+
+    strike = _safe_float(row.get("strike"))
+    expiry_txt = row.get("expiry")
+    occ = row.get("occ")
+
+    # If OCC already provided, we just keep it and don't try to be smart
+    if occ:
+        return {
+            "strike": strike,
+            "expiry": expiry_txt,
+            "occ": occ,
+        }
+
+    cp_u = (cp_dir or "").upper() if cp_dir else None
+    if cp_u not in ("C", "P"):
+        # Can't compute default option without call/put direction
+        return {
+            "strike": strike,
+            "expiry": expiry_txt,
+            "occ": occ,
+        }
+
+    # --- Expiry ---
+
+    if expiry_txt:
+        try:
+            expiry_date = datetime.fromisoformat(expiry_txt).date()
+        except Exception:
+            expiry_date = datetime.now(timezone.utc).date()
+            expiry_txt = expiry_date.isoformat()
+    else:
+        weeks = defaults.get("expiry_weeks")
+        try:
+            weeks = int(weeks) if weeks is not None else 3
+        except Exception:
+            weeks = 3
+        expiry_date = (datetime.now(timezone.utc) + timedelta(weeks=weeks)).date()
+        expiry_txt = expiry_date.isoformat()
+
+    # --- Strike (pre-snap target) ---
+
+    if strike is None:
+        offset_pct = _safe_float(defaults.get("strike_offset_pct")) or 0.0
+        if cp_u == "C":
+            strike = spot_price * (1.0 + offset_pct)
+        else:
+            strike = spot_price * (1.0 - offset_pct)
+
+        strike = round(strike, 2)
+
+        # Snap to nearest listed strike from Tradier chain
+        strike = _snap_strike_to_tradier_chain(symbol, expiry_date, strike)
+    else:
+        # Optional: snap user-provided strike as well
+        strike = _snap_strike_to_tradier_chain(symbol, expiry_date, strike)
+
+    occ_built = _build_occ(symbol, expiry_date, cp_u, strike)
+
+    return {
+        "strike": strike,
+        "expiry": expiry_txt,
+        "occ": occ_built,
+    }
+
+
+# ---------- Entry / SL / TP helpers ----------
 
 def _decide_entry_and_sl_conds(
     asset_type: str,
@@ -324,10 +443,8 @@ def _compute_sl_tp_levels(
     tp_level = existing_tp_level
 
     if sl_level is None or tp_level is None:
-        # Basic "direction" logic:
-        # - options: use call/put semantics
-        # - equity: assume bullish by default
         if atype == "option" and cp_u in ("C", "P"):
+            # Options: use call/put semantics
             if cp_u == "C":
                 # Call: bullish
                 if sl_level is None and sl_pct > 0:
@@ -366,94 +483,7 @@ def _decide_qty(row: Dict[str, Any], defaults: Dict[str, Any]) -> int:
         return 0
 
 
-def _compute_option_strike_and_expiry(
-    row: Dict[str, Any],
-    defaults: Dict[str, Any],
-    spot_price: float,
-    cp_dir: Optional[str],
-) -> Dict[str, Any]:
-    """
-    Determine strike, expiry, and occ for an option row.
-
-    - If row provides strike/expiry/occ, we respect them.
-    - Otherwise we use:
-        - expiry_weeks: ~N weeks out
-        - strike_offset_pct: e.g. 5%
-      and then SNAP the strike to the nearest listed strike from
-      Tradier's option chain (if available).
-    """
-    symbol = (row.get("symbol") or "").upper()
-
-    strike = _safe_float(row.get("strike"))
-    expiry_txt = row.get("expiry")
-    occ = row.get("occ")
-
-    # If OCC already provided, we just keep it and don't try to be smart
-    if occ:
-        return {
-            "strike": strike,
-            "expiry": expiry_txt,
-            "occ": occ,
-        }
-
-    # We need cp_dir to choose direction
-    cp_u = (cp_dir or "").upper() if cp_dir else None
-    if cp_u not in ("C", "P"):
-        # Can't compute default option without call/put direction
-        return {
-            "strike": strike,
-            "expiry": expiry_txt,
-            "occ": occ,
-        }
-
-    # --- Expiry ---
-
-    if expiry_txt:
-        try:
-            # Assume YYYY-MM-DD
-            expiry_date = datetime.fromisoformat(expiry_txt).date()
-        except Exception:
-            expiry_date = datetime.now(timezone.utc).date()
-    else:
-        weeks = defaults.get("expiry_weeks")
-        try:
-            weeks = int(weeks) if weeks is not None else 3
-        except Exception:
-            weeks = 3
-        expiry_date = (datetime.now(timezone.utc) + timedelta(weeks=weeks)).date()
-        expiry_txt = expiry_date.isoformat()
-
-    # --- Strike (pre-snap target) ---
-
-    if strike is None:
-        offset_pct = _safe_float(defaults.get("strike_offset_pct")) or 0.0
-        if cp_u == "C":
-            strike = spot_price * (1.0 + offset_pct)
-        else:
-            strike = spot_price * (1.0 - offset_pct)
-
-        # Basic rounding before we snap to real strikes
-        strike = round(strike, 2)
-
-        # Try to snap to nearest listed strike from Tradier chain
-        strike = _snap_strike_to_tradier_chain(symbol, expiry_date, strike)
-    else:
-        # If user provided a strike, we can still optionally snap it
-        # to a real listed strike (can comment this out if you prefer
-        # to respect user-provided strike exactly).
-        strike = _snap_strike_to_tradier_chain(symbol, expiry_date, strike)
-
-    # --- Build OCC with final snapped strike ---
-
-    occ_built = _build_occ(symbol, expiry_date, cp_u, strike)
-
-    return {
-        "strike": strike,
-        "expiry": expiry_txt,
-        "occ": occ_built,
-    }
-
-
+# ---------- Row builders ----------
 
 def _build_active_trade_row(
     row: Dict[str, Any],
@@ -534,16 +564,15 @@ def _build_active_trade_row(
     sl_level = sltp["sl_level"]
     tp_level = sltp["tp_level"]
 
-    # --- ensure sl_cond is set whenever we synthesized an SL level for options ---
+    # Ensure sl_cond is set whenever we have an SL level for options
     if asset_type == "option" and sl_level is not None and sl_cond is None:
         if cp_dir == "C":
             sl_cond = "cb"   # call: stop if close below
         else:
             sl_cond = "ca"   # put: stop if close above
 
-    # --- ensure sl_tf is never NULL when sl_level exists ---
+    # Ensure sl_tf is never NULL when sl_level exists
     if sl_level is not None and not sl_tf:
-        # fallback: entry_tf or default 5m
         sl_tf = entry_tf or defaults.get("entry_tf") or "5m"
 
     # For options, compute strike/expiry/occ if needed
@@ -576,7 +605,6 @@ def _build_active_trade_row(
 
     now_iso = _now_iso()
 
-    # Build active_trades row
     active_row: Dict[str, Any] = {
         "id": str(uuid.uuid4()),
         "symbol": symbol,
@@ -608,10 +636,13 @@ def _build_active_trade_row(
     return active_row
 
 
+# ---------- DB IO helpers ----------
+
 def _fetch_pending_new_trades() -> List[Dict[str, Any]]:
     """
     Fetch all rows from new_trades. We assume every row here is pending import.
     """
+    sb = get_client()
     try:
         resp = sb.table("new_trades").select("*").execute()
         rows = getattr(resp, "data", None) or []
@@ -625,6 +656,7 @@ def _insert_active_trade(row: Dict[str, Any]) -> None:
     """
     Insert a single row into active_trades.
     """
+    sb = get_client()
     try:
         sb.table("active_trades").insert(row).execute()
     except Exception as e:
@@ -636,6 +668,7 @@ def _delete_new_trade(row_id: Any) -> None:
     """
     Delete a single row from new_trades by id.
     """
+    sb = get_client()
     try:
         sb.table("new_trades").delete().eq("id", row_id).execute()
     except Exception as e:
@@ -653,7 +686,7 @@ async def run_new_trades_import_loop() -> None:
       2) For each:
            - Load trade_defaults by asset_type + trade_type (default swing).
            - Fetch underlying spot (spot table first, then Tradier with retries).
-           - Compute qty, SL/TP, strike/expiry/occ (for options).
+           - Compute qty, SL/TP, strike/expiry/occ (for options, using chain snap).
            - Insert into active_trades with status = nt-waiting, manage = Y.
            - Delete row from new_trades on success.
       3) Sleep, then repeat.
