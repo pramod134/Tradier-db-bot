@@ -418,7 +418,7 @@ def _compute_option_strike_and_expiry(
             target_days = weeks * 7
             expiry_date = _snap_expiry_to_tradier(symbol, target_days)
     else:
-        weeks = int(defaults.get("option_expiry_weeks") or 3)
+        weeks = int(defaults.get("expiry_weeks") or 3)
         target_days = weeks * 7
         expiry_date = _snap_expiry_to_tradier(symbol, target_days)
 
