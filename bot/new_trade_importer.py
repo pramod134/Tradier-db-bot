@@ -414,7 +414,7 @@ def _compute_option_strike_and_expiry(
             expiry_date = datetime.strptime(expiry_text, "%Y-%m-%d").date()
         except Exception:
             # If user expiry is malformed, fall back to default logic
-            weeks = int(defaults.get("option_expiry_weeks") or 3)
+            weeks = int(defaults.get("expiry_weeks") or 3)
             target_days = weeks * 7
             expiry_date = _snap_expiry_to_tradier(symbol, target_days)
     else:
