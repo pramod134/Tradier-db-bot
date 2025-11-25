@@ -3,7 +3,7 @@
 import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from supabase import Client, create_client
@@ -34,6 +34,32 @@ def _safe_float(v: Any) -> Optional[float]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_cp(raw: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Normalize cp field from new_trades.
+
+    Returns:
+      (cp_db, cp_dir)
+
+      cp_db  = value suitable for cp_enum in DB: 'call' | 'put' | None
+      cp_dir = direction flag for logic: 'C' | 'P' | None
+    """
+    if raw is None:
+        return None, None
+
+    s = str(raw).strip().lower()
+    if not s:
+        return None, None
+
+    if s in ("call", "c", "buy_call", "long_call"):
+        return "call", "C"
+    if s in ("put", "p", "buy_put", "long_put"):
+        return "put", "P"
+
+    # Unknown / invalid
+    return None, None
 
 
 async def _get_underlier_spot(
@@ -143,7 +169,7 @@ def _fetch_trade_defaults(asset_type: str, trade_type: str) -> Optional[Dict[str
         return None
 
 
-def _build_occ(symbol: str, expiry_date: datetime.date, cp: str, strike: float) -> str:
+def _build_occ(symbol: str, expiry_date: datetime.date, cp_dir: str, strike: float) -> str:
     """
     Build an OCC-style option symbol like AMD250919C00160000.
 
@@ -154,14 +180,15 @@ def _build_occ(symbol: str, expiry_date: datetime.date, cp: str, strike: float) 
     yy = expiry_date.year % 100
     mm = expiry_date.month
     dd = expiry_date.day
-    cp_u = (cp or "").upper()
-    if cp_u not in ("C", "P"):
-        cp_u = "C"
+
+    cp_letter = (cp_dir or "C").upper()
+    if cp_letter not in ("C", "P"):
+        cp_letter = "C"
 
     strike_int = int(round(strike * 1000))
     strike_code = f"{strike_int:08d}"
 
-    return f"{root}{yy:02d}{mm:02d}{dd:02d}{cp_u}{strike_code}"
+    return f"{root}{yy:02d}{mm:02d}{dd:02d}{cp_letter}{strike_code}"
 
 
 def _parse_trade_type(raw: Any) -> str:
@@ -173,7 +200,7 @@ def _parse_trade_type(raw: Any) -> str:
 
 def _decide_entry_and_sl_conds(
     asset_type: str,
-    cp: Optional[str],
+    cp_dir: Optional[str],
     entry_cond: Optional[str],
     entry_level: Optional[float],
     entry_tf: Optional[str],
@@ -190,13 +217,13 @@ def _decide_entry_and_sl_conds(
       - For equities: we leave user values as-is; if all missing → 'now'.
     """
     atype = (asset_type or "").lower()
-    cp_u = (cp or "").upper() if cp else None
+    cp_u = (cp_dir or "").upper() if cp_dir else None
 
     # No entry parameters at all → enter now
     if not entry_cond and entry_level is None and not entry_tf:
         entry_cond = "now"
 
-    # For options, if we have a level but no condition, base on cp
+    # For options, if we have a level but no condition, base on cp_dir
     if atype == "option" and cp_u in ("C", "P"):
         if not entry_cond and entry_level is not None:
             if cp_u == "C":
@@ -218,7 +245,7 @@ def _decide_entry_and_sl_conds(
 
 def _compute_sl_tp_levels(
     asset_type: str,
-    cp: Optional[str],
+    cp_dir: Optional[str],
     spot_price: float,
     defaults: Dict[str, Any],
     existing_sl_level: Optional[float],
@@ -237,7 +264,7 @@ def _compute_sl_tp_levels(
     tp_pct = _safe_float(defaults.get("tp_pct")) or 0.0
 
     atype = (asset_type or "").lower()
-    cp_u = (cp or "").upper() if cp else None
+    cp_u = (cp_dir or "").upper() if cp_dir else None
 
     sl_level = existing_sl_level
     tp_level = existing_tp_level
@@ -289,6 +316,7 @@ def _compute_option_strike_and_expiry(
     row: Dict[str, Any],
     defaults: Dict[str, Any],
     spot_price: float,
+    cp_dir: Optional[str],
 ) -> Dict[str, Any]:
     """
     Determine strike, expiry, and occ for an option row.
@@ -299,14 +327,12 @@ def _compute_option_strike_and_expiry(
         - strike_offset_pct: 5% default
     """
     symbol = (row.get("symbol") or "").upper()
-    cp = (row.get("cp") or "").upper()
 
     strike = _safe_float(row.get("strike"))
     expiry_txt = row.get("expiry")
     occ = row.get("occ")
 
     # If OCC already provided, we just keep it and don't try to be smart
-    # (optional: we could parse it to fill strike/expiry later if needed).
     if occ:
         return {
             "strike": strike,
@@ -314,9 +340,10 @@ def _compute_option_strike_and_expiry(
             "occ": occ,
         }
 
-    # We need cp to choose direction
-    if cp not in ("C", "P"):
-        # Can't compute default option without call/put
+    # We need cp_dir to choose direction
+    cp_u = (cp_dir or "").upper() if cp_dir else None
+    if cp_u not in ("C", "P"):
+        # Can't compute default option without call/put direction
         return {
             "strike": strike,
             "expiry": expiry_txt,
@@ -342,7 +369,7 @@ def _compute_option_strike_and_expiry(
     # Strike
     if strike is None:
         offset_pct = _safe_float(defaults.get("strike_offset_pct")) or 0.0
-        if cp == "C":
+        if cp_u == "C":
             strike = spot_price * (1.0 + offset_pct)
         else:
             strike = spot_price * (1.0 - offset_pct)
@@ -350,7 +377,7 @@ def _compute_option_strike_and_expiry(
         # Round to something reasonable (2 decimals)
         strike = round(strike, 2)
 
-    occ_built = _build_occ(symbol, expiry_date, cp, strike)
+    occ_built = _build_occ(symbol, expiry_date, cp_u, strike)
 
     return {
         "strike": strike,
@@ -386,7 +413,8 @@ def _build_active_trade_row(
 
     trade_type = _parse_trade_type(row.get("trade_type"))
 
-    cp = (row.get("cp") or "").upper() if row.get("cp") else None
+    # cp_db = 'call'/'put' for DB; cp_dir = 'C'/'P' for direction logic
+    cp_db, cp_dir = _parse_cp(row.get("cp"))
 
     # Qty
     qty = _decide_qty(row, defaults)
@@ -411,7 +439,7 @@ def _build_active_trade_row(
     # Decide entry_cond / sl_cond based on rules
     conds = _decide_entry_and_sl_conds(
         asset_type=asset_type,
-        cp=cp,
+        cp_dir=cp_dir,
         entry_cond=entry_cond,
         entry_level=entry_level,
         entry_tf=entry_tf,
@@ -428,7 +456,7 @@ def _build_active_trade_row(
     # Compute SL/TP levels if missing
     sltp = _compute_sl_tp_levels(
         asset_type=asset_type,
-        cp=cp,
+        cp_dir=cp_dir,
         spot_price=spot_price,
         defaults=defaults,
         existing_sl_level=sl_level,
@@ -443,12 +471,14 @@ def _build_active_trade_row(
     occ = None
 
     if asset_type == "option":
-        opt_info = _compute_option_strike_and_expiry(row, defaults, spot_price)
+        opt_info = _compute_option_strike_and_expiry(
+            row, defaults, spot_price, cp_dir
+        )
         strike = opt_info["strike"]
         expiry_txt = opt_info["expiry"]
         occ = opt_info["occ"]
 
-        if cp not in ("C", "P"):
+        if cp_dir not in ("C", "P"):
             log("error", "nt_import_option_missing_cp", symbol=symbol, row=row)
             return None
         if strike is None or not expiry_txt or not occ:
@@ -456,7 +486,7 @@ def _build_active_trade_row(
                 "error",
                 "nt_import_option_incomplete",
                 symbol=symbol,
-                cp=cp,
+                cp=row.get("cp"),
                 strike=strike,
                 expiry=expiry_txt,
                 occ=occ,
@@ -472,7 +502,7 @@ def _build_active_trade_row(
         "asset_type": asset_type,
         "status": "nt-waiting",
         "qty": qty,
-        "cp": cp,
+        "cp": cp_db,
         "strike": strike,
         "expiry": expiry_txt,
         "occ": occ,
@@ -597,7 +627,9 @@ async def run_new_trades_import_loop() -> None:
                             continue
 
                         # 3) Build active_trades row
-                        active_row = _build_active_trade_row(row, defaults, spot_price)
+                        active_row = _build_active_trade_row(
+                            row, defaults, spot_price
+                        )
                         if not active_row:
                             log(
                                 "error",
