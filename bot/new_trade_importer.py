@@ -435,6 +435,7 @@ def _build_active_trade_row(
 
     tp_type = row.get("tp_type") or "equity"
     tp_level = _safe_float(row.get("tp_level"))
+    
 
     # Decide entry_cond / sl_cond based on rules
     conds = _decide_entry_and_sl_conds(
@@ -464,6 +465,22 @@ def _build_active_trade_row(
     )
     sl_level = sltp["sl_level"]
     tp_level = sltp["tp_level"]
+
+
+        # --- FIX: ensure sl_cond is assigned after sl_level creation ---
+    if asset_type == "option" and sl_level is not None and sl_cond is None:
+        if cp_dir == "C":
+            sl_cond = "cb"   # call: stop if close below
+        else:
+            sl_cond = "ca"   # put: stop if close above
+
+    # --- FIX: ensure sl_tf is never NULL when sl_level exists ---
+    if sl_level is not None and not sl_tf:
+        # fallback: entry_tf or default 5m
+        sl_tf = entry_tf or defaults.get("entry_tf") or "5m"
+
+
+    
 
     # For options, compute strike/expiry/occ if needed
     strike = None
