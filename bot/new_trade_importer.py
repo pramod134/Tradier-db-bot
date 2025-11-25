@@ -31,6 +31,52 @@ def _safe_float(v: Any) -> Optional[float]:
     except Exception:
         return None
 
+def _snap_strike_to_tradier_chain(symbol: str, expiry_date, target_strike: float) -> float:
+    base = settings.tradier_live_base.rstrip("/")
+    url = f"{base}/v1/markets/options/chains"
+
+    params = {
+        "symbol": symbol.upper(),
+        "expiration": expiry_date.isoformat(),
+        "greeks": "false",
+    }
+
+    headers = {
+        "Authorization": f"Bearer {settings.tradier_live_token}",
+        "Accept": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        options = (data.get("options") or {}).get("option") or []
+        strikes = []
+
+        for opt in options:
+            s = _safe_float(opt.get("strike"))
+            if s is not None:
+                strikes.append(s)
+
+        if not strikes:
+            return target_strike
+
+        nearest = min(strikes, key=lambda s: abs(s - target_strike))
+        return nearest
+
+    except Exception as e:
+        log(
+            "error",
+            "nt_import_chain_snap_error",
+            symbol=symbol,
+            expiry=expiry_date.isoformat(),
+            target_strike=target_strike,
+            error=str(e),
+        )
+        return target_strike
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -332,7 +378,9 @@ def _compute_option_strike_and_expiry(
     - If row provides strike/expiry/occ, we respect them.
     - Otherwise we use:
         - expiry_weeks: ~N weeks out
-        - strike_offset_pct: 5% default
+        - strike_offset_pct: e.g. 5%
+      and then SNAP the strike to the nearest listed strike from
+      Tradier's option chain (if available).
     """
     symbol = (row.get("symbol") or "").upper()
 
@@ -358,7 +406,8 @@ def _compute_option_strike_and_expiry(
             "occ": occ,
         }
 
-    # Expiry
+    # --- Expiry ---
+
     if expiry_txt:
         try:
             # Assume YYYY-MM-DD
@@ -374,7 +423,8 @@ def _compute_option_strike_and_expiry(
         expiry_date = (datetime.now(timezone.utc) + timedelta(weeks=weeks)).date()
         expiry_txt = expiry_date.isoformat()
 
-    # Strike
+    # --- Strike (pre-snap target) ---
+
     if strike is None:
         offset_pct = _safe_float(defaults.get("strike_offset_pct")) or 0.0
         if cp_u == "C":
@@ -382,8 +432,18 @@ def _compute_option_strike_and_expiry(
         else:
             strike = spot_price * (1.0 - offset_pct)
 
-        # Round to something reasonable (2 decimals)
+        # Basic rounding before we snap to real strikes
         strike = round(strike, 2)
+
+        # Try to snap to nearest listed strike from Tradier chain
+        strike = _snap_strike_to_tradier_chain(symbol, expiry_date, strike)
+    else:
+        # If user provided a strike, we can still optionally snap it
+        # to a real listed strike (can comment this out if you prefer
+        # to respect user-provided strike exactly).
+        strike = _snap_strike_to_tradier_chain(symbol, expiry_date, strike)
+
+    # --- Build OCC with final snapped strike ---
 
     occ_built = _build_occ(symbol, expiry_date, cp_u, strike)
 
@@ -392,6 +452,7 @@ def _compute_option_strike_and_expiry(
         "expiry": expiry_txt,
         "occ": occ_built,
     }
+
 
 
 def _build_active_trade_row(
