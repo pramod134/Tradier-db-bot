@@ -171,12 +171,20 @@ def _fetch_trade_defaults(asset_type: str, trade_type: str) -> Optional[Dict[str
 
 def _build_occ(symbol: str, expiry_date: datetime.date, cp_dir: str, strike: float) -> str:
     """
-    Build an OCC-style option symbol like AMD250919C00160000.
+    Build an OCC-style option symbol in Tradier format, e.g.:
 
-    Format:
-      ROOT(6) + YY + MM + DD + C/P + STRIKE(8, strike * 1000)
+      AMD, 2025-09-19, call, 160.0  -> "AMD250919C00160000"
+      LLY, 2025-12-16, call, 1160.0 -> "LLY251216C01160000"
+
+    Format (no spaces):
+      ROOT (1–6 chars, uppercased ticker) +
+      YYMMDD +
+      C/P +
+      STRIKE (8 digits = round(strike * 1000))
     """
+    # ROOT: just the ticker, uppercased, no padding spaces
     root = (symbol or "").upper().strip()
+
     yy = expiry_date.year % 100
     mm = expiry_date.month
     dd = expiry_date.day
@@ -185,7 +193,7 @@ def _build_occ(symbol: str, expiry_date: datetime.date, cp_dir: str, strike: flo
     if cp_letter not in ("C", "P"):
         cp_letter = "C"
 
-    strike_int = int(round(strike * 1000))
+    strike_int = int(round(float(strike) * 1000))
     strike_code = f"{strike_int:08d}"
 
     return f"{root}{yy:02d}{mm:02d}{dd:02d}{cp_letter}{strike_code}"
@@ -435,7 +443,6 @@ def _build_active_trade_row(
 
     tp_type = row.get("tp_type") or "equity"
     tp_level = _safe_float(row.get("tp_level"))
-    
 
     # Decide entry_cond / sl_cond based on rules
     conds = _decide_entry_and_sl_conds(
@@ -466,21 +473,17 @@ def _build_active_trade_row(
     sl_level = sltp["sl_level"]
     tp_level = sltp["tp_level"]
 
-
-        # --- FIX: ensure sl_cond is assigned after sl_level creation ---
+    # --- ensure sl_cond is set whenever we synthesized an SL level for options ---
     if asset_type == "option" and sl_level is not None and sl_cond is None:
         if cp_dir == "C":
             sl_cond = "cb"   # call: stop if close below
         else:
             sl_cond = "ca"   # put: stop if close above
 
-    # --- FIX: ensure sl_tf is never NULL when sl_level exists ---
+    # --- ensure sl_tf is never NULL when sl_level exists ---
     if sl_level is not None and not sl_tf:
         # fallback: entry_tf or default 5m
         sl_tf = entry_tf or defaults.get("entry_tf") or "5m"
-
-
-    
 
     # For options, compute strike/expiry/occ if needed
     strike = None
