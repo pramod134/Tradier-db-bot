@@ -303,10 +303,6 @@ def _snap_strike_to_tradier_chain(
     return rounded
 
 
-
-
-from datetime import date
-
 def _snap_expiry_to_tradier(symbol: str, target_days: int) -> date:
     """
     Use Tradier's expirations endpoint to find a *real* expiry
@@ -378,34 +374,37 @@ def _snap_expiry_to_tradier(symbol: str, target_days: int) -> date:
         return target_date
 
 
-
-
 def _compute_option_strike_and_expiry(
     row: Dict[str, Any],
-    spot: float,
     defaults: Dict[str, Any],
-) -> Tuple[float, str]:
+    spot: float,
+    cp_dir: Optional[str],
+) -> Dict[str, Any]:
     """
-    Decide strike + expiry for a new option trade.
+    Decide strike + expiry + occ for a new option trade.
 
-    - If user provided strike/expiry, respect them (with minimal parsing).
+    - If user provided strike/expiry, we respect them (parsing best-effort).
     - Otherwise:
-      * expiry: today + weeks_from_defaults → snapped to real Tradier expiry
-      * strike: +/- % from spot, depending on call/put, then snapped to chain
+      * expiry: today + weeks_from_defaults, snapped to a real Tradier expiry.
+      * strike: +/- % from spot, depending on call/put, then snapped to chain.
     """
-    symbol = row["symbol"]
-    cp = (row.get("cp") or "call").lower()
+    symbol = (row.get("symbol") or "").upper()
 
     # ----- STRIKE TARGET -----
     user_strike = _safe_float(row.get("strike"))
     strike_pct = _safe_float(defaults.get("option_strike_pct")) or 0.05
 
+    # Direction: C (call) / P (put)
+    cp_letter = (cp_dir or "C").upper()
+    if cp_letter not in ("C", "P"):
+        cp_letter = "C"
+
     if user_strike is not None:
         target_strike = user_strike
     else:
-        if cp == "put":
+        if cp_letter == "P":
             target_strike = spot * (1.0 - strike_pct)
-        else:  # default call
+        else:  # call (default)
             target_strike = spot * (1.0 + strike_pct)
 
     # ----- EXPIRY -----
@@ -414,7 +413,10 @@ def _compute_option_strike_and_expiry(
         try:
             expiry_date = datetime.strptime(expiry_text, "%Y-%m-%d").date()
         except Exception:
-            expiry_date = datetime.now(timezone.utc).date()
+            # If user expiry is malformed, fall back to default logic
+            weeks = int(defaults.get("option_expiry_weeks") or 3)
+            target_days = weeks * 7
+            expiry_date = _snap_expiry_to_tradier(symbol, target_days)
     else:
         weeks = int(defaults.get("option_expiry_weeks") or 3)
         target_days = weeks * 7
@@ -423,10 +425,14 @@ def _compute_option_strike_and_expiry(
     # ----- SNAP STRIKE TO REAL CHAIN (OR SAFE FALLBACK) -----
     final_strike = _snap_strike_to_tradier_chain(symbol, expiry_date, target_strike)
 
-    return final_strike, expiry_date.isoformat()
+    # ----- OCC CODE -----
+    occ = _build_occ(symbol, expiry_date, cp_letter, final_strike)
 
-
-
+    return {
+        "strike": final_strike,
+        "expiry": expiry_date.isoformat(),
+        "occ": occ,
+    }
 
 
 # ---------- Entry / SL / TP helpers ----------
@@ -642,7 +648,10 @@ def _build_active_trade_row(
 
     if asset_type == "option":
         opt_info = _compute_option_strike_and_expiry(
-            row, defaults, spot_price, cp_dir
+            row=row,
+            defaults=defaults,
+            spot=spot_price,
+            cp_dir=cp_dir,
         )
         strike = opt_info["strike"]
         expiry_txt = opt_info["expiry"]
