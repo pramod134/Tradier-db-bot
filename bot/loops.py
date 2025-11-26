@@ -14,6 +14,33 @@ from . import spot_indicators
 
 symbol_index_for_indicators = 0
 
+import re
+
+OCC_UNDERLYING_RE = re.compile(r"^([A-Za-z]+)")
+
+def extract_underlier(occ: str) -> str:
+    """
+    Extract underlier for OCC symbols like:
+        SPY251126P00672000 → SPY
+        QQQ251231C00644000 → QQQ
+        AMD260102P00180000 → AMD
+
+    If it's already an equity ticker (only letters), return unchanged.
+    """
+    if not occ:
+        return ""
+
+    # If no digits → already an equity
+    if occ.isalpha():
+        return occ.upper()
+
+    m = OCC_UNDERLYING_RE.match(occ)
+    if m:
+        return m.group(1).upper()
+
+    return occ.upper()
+
+
 
 
 def _now_iso() -> str:
@@ -95,18 +122,21 @@ async def run_positions_loop() -> None:
                     contract_multiplier = 100 if is_option else 1
 
                     # For options, symbol is OCC, occ = OCC
-                    symbol = sym_raw
-                    occ = sym_raw if is_option else None
-
-                    # Try to find underlier symbol for options from instrument if present
-                    underlier_symbol = ""
                     if is_option:
-                        # Tradier often has "underlying" or the underlier in "symbol" field of instrument
-                        underlier_symbol = (
-                            str(inst.get("underlying") or inst.get("symbol") or "")
-                            .upper()
-                            .strip()
-                        )
+                        # OCC string from Tradier (e.g. SPY251126P00672000)
+                        occ = sym_raw
+                    
+                        # Underlier extracted from OCC (SPY251126P00672000 → SPY)
+                        underlier_symbol = extract_underlier(sym_raw)
+                    
+                        # The “symbol” we store in DB is always the simple underlier
+                        symbol = underlier_symbol
+                    else:
+                        # Equity case — symbol is already correct
+                        occ = None
+                        underlier_symbol = ""
+                        symbol = sym_raw
+
 
                     # Collect for quotes:
                     if asset_type == "equity":
