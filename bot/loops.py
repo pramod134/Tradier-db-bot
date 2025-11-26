@@ -18,6 +18,7 @@ import re
 
 OCC_UNDERLYING_RE = re.compile(r"^([A-Za-z]+)")
 
+
 def extract_underlier(occ: str) -> str:
     """
     Extract underlier for OCC symbols like:
@@ -41,8 +42,6 @@ def extract_underlier(occ: str) -> str:
     return occ.upper()
 
 
-
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -63,7 +62,7 @@ async def run_positions_loop() -> None:
     """
     Periodically sync positions from Tradier SANDBOX into public.positions.
 
-    NEW: This loop now also fetches LIVE quotes before inserting,
+    This loop also fetches LIVE quotes before inserting,
     so each row in positions is born with mark / prev_close / underlier_spot
     already filled as best as possible.
     """
@@ -121,14 +120,13 @@ async def run_positions_loop() -> None:
                     asset_type = "option" if is_option else "equity"
                     contract_multiplier = 100 if is_option else 1
 
-                    # For options, symbol is OCC, occ = OCC
                     if is_option:
                         # OCC string from Tradier (e.g. SPY251126P00672000)
                         occ = sym_raw
-                    
+
                         # Underlier extracted from OCC (SPY251126P00672000 → SPY)
                         underlier_symbol = extract_underlier(sym_raw)
-                    
+
                         # The “symbol” we store in DB is always the simple underlier
                         symbol = underlier_symbol
                     else:
@@ -137,13 +135,15 @@ async def run_positions_loop() -> None:
                         underlier_symbol = ""
                         symbol = sym_raw
 
-
                     # Collect for quotes:
                     if asset_type == "equity":
-                        symbols_to_quote.append(symbol)  # equity symbol itself
+                        # Equities: quote the symbol itself
+                        symbols_to_quote.append(symbol)
                     else:
-                        # Option: need both OCC and underlier for spot
-                        symbols_to_quote.append(symbol)  # option quote
+                        # Options: quote the OCC for option price,
+                        # and the underlier for spot.
+                        if occ:
+                            symbols_to_quote.append(occ)
                         if underlier_symbol:
                             symbols_to_quote.append(underlier_symbol)
 
@@ -162,7 +162,9 @@ async def run_positions_loop() -> None:
 
                 # 3) Fetch LIVE quotes for all collected symbols
                 async with httpx.AsyncClient() as live_client:
-                    quotes = await tradier_client.fetch_quotes(live_client, symbols_to_quote)
+                    quotes = await tradier_client.fetch_quotes(
+                        live_client, symbols_to_quote
+                    )
 
                 # 4) Build fully-populated rows and upsert into positions
                 current_ids: List[str] = []
@@ -182,8 +184,9 @@ async def run_positions_loop() -> None:
                     underlier_spot = None
 
                     if asset_type == "option":
-                        # Option mark from OCC symbol
-                        oq = quotes.get(symbol)
+                        # Option mark from OCC symbol (fallback to symbol)
+                        oq_key = occ or symbol
+                        oq = quotes.get(oq_key)
                         if oq:
                             mark = oq.get("last") or oq.get("close")
                             prev_close = oq.get("prevclose")
@@ -204,7 +207,7 @@ async def run_positions_loop() -> None:
                     # Build primary key id
                     pid_symbol = occ if (asset_type == "option" and occ) else symbol
                     pid = supabase_client.build_tradier_id(account_id, pid_symbol)
-                    
+
                     row: Dict[str, Any] = {
                         "id": pid,
                         "symbol": symbol,
@@ -267,11 +270,19 @@ async def run_quotes_loop() -> None:
             for r in active:
                 symbol = str(r.get("symbol", "")).upper()
                 underlier = str(r.get("underlier") or "").upper()
+                occ = str(r.get("occ") or "").upper()
+                asset_type = r.get("asset_type")
 
-                if symbol:
-                    symbols_to_quote.append(symbol)
-                if underlier:
-                    symbols_to_quote.append(underlier)
+                if asset_type == "option":
+                    # For options, quote OCC for option price and underlier for spot
+                    if occ:
+                        symbols_to_quote.append(occ)
+                    if underlier:
+                        symbols_to_quote.append(underlier)
+                else:
+                    # For equities, just quote the symbol
+                    if symbol:
+                        symbols_to_quote.append(symbol)
 
             async with httpx.AsyncClient() as client:
                 quotes = await tradier_client.fetch_quotes(client, symbols_to_quote)
@@ -280,6 +291,7 @@ async def run_quotes_loop() -> None:
                 pid = r["id"]
                 symbol = str(r.get("symbol", "")).upper()
                 underlier = str(r.get("underlier") or "").upper()
+                occ = str(r.get("occ") or "").upper()
                 asset_type = r.get("asset_type")
 
                 mark = None
@@ -287,11 +299,14 @@ async def run_quotes_loop() -> None:
                 underlier_spot = None
 
                 if asset_type == "option":
-                    oq = quotes.get(symbol)
+                    # Option mark from OCC (fallback to symbol)
+                    oq_key = occ or symbol
+                    oq = quotes.get(oq_key)
                     if oq:
                         mark = oq.get("last") or oq.get("close")
                         prev_close = oq.get("prevclose")
 
+                    # Underlier spot from underlier
                     if underlier:
                         uq = quotes.get(underlier)
                         if uq:
@@ -377,7 +392,6 @@ async def run_spot_indicators_loop() -> None:
                 symbol = symbols[symbol_index_for_indicators]
                 symbol_index_for_indicators += 1  # next cycle will use the next symbol
 
-
                 log(
                     "info",
                     "spot_indicators_symbol_cycle",
@@ -452,5 +466,3 @@ async def run_spot_indicators_loop() -> None:
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         await asyncio.sleep(max(0, interval - elapsed))
-
-
