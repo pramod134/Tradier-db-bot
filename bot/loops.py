@@ -202,8 +202,9 @@ async def run_positions_loop() -> None:
                             underlier_spot = mark
 
                     # Build primary key id
-                    pid = supabase_client.build_tradier_id(account_id, symbol)
-
+                    pid_symbol = occ if (asset_type == "option" and occ) else symbol
+                    pid = supabase_client.build_tradier_id(account_id, pid_symbol)
+                    
                     row: Dict[str, Any] = {
                         "id": pid,
                         "symbol": symbol,
