@@ -453,7 +453,8 @@ def _decide_entry_and_sl_conds(
       - For options:
           Calls: default entry_cond 'ca', sl_cond 'cb'
           Puts:  default entry_cond 'cb', sl_cond 'ca'
-      - For equities: we leave user values as-is; if all missing → 'now'.
+      - For non-options (equities):
+          If sl_level is set and sl_cond is missing → sl_cond = 'cb'.
     """
     atype = (asset_type or "").lower()
     cp_u = (cp_dir or "").upper() if cp_dir else None
@@ -466,15 +467,21 @@ def _decide_entry_and_sl_conds(
     if atype == "option" and cp_u in ("C", "P"):
         if not entry_cond and entry_level is not None:
             if cp_u == "C":
-                entry_cond = "ca"  # close above level
+                entry_cond = "ca"  # call: close above level
             else:
-                entry_cond = "cb"  # close below level
+                entry_cond = "cb"  # put: close below level
 
         if not sl_cond and sl_level is not None:
             if cp_u == "C":
-                sl_cond = "cb"  # stop if close below SL
+                sl_cond = "cb"  # call: stop if price closes below SL
             else:
-                sl_cond = "ca"  # stop if close above SL
+                sl_cond = "ca"  # put: stop if price closes above SL
+
+    else:
+        # Non-options (equities, etc.): default SL cond to 'cb'
+        # whenever there is an SL level but no condition.
+        if not sl_cond and sl_level is not None:
+            sl_cond = "cb"
 
     return {
         "entry_cond": entry_cond,
