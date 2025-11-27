@@ -626,6 +626,7 @@ def _build_active_trade_row(
         entry_level = spot_price
 
     # Compute SL/TP levels if missing
+       
     sltp = _compute_sl_tp_levels(
         asset_type=asset_type,
         cp_dir=cp_dir,
@@ -637,12 +638,23 @@ def _build_active_trade_row(
     sl_level = sltp["sl_level"]
     tp_level = sltp["tp_level"]
 
-    # Ensure sl_cond is set whenever we have an SL level for options
-    if asset_type == "option" and sl_level is not None and sl_cond is None:
-        if cp_dir == "C":
-            sl_cond = "cb"   # call: stop if close below
+    # FINAL SAFETY NET:
+    # Ensure sl_cond is set whenever we have an SL level.
+    # - Options: use cp (call/put) to decide direction.
+    # - Equities / others: default to 'cb'.
+    if sl_level is not None and sl_cond is None:
+        if asset_type == "option":
+            if cp_dir == "C":
+                sl_cond = "cb"  # call: SL if price goes below
+            elif cp_dir == "P":
+                sl_cond = "ca"  # put: SL if price goes above
+            else:
+                # unknown cp -> fall back to equity-style default
+                sl_cond = "cb"
         else:
-            sl_cond = "ca"   # put: stop if close above
+            # equity (or anything non-option) default SL cond
+            sl_cond = "cb"
+
 
     # Ensure sl_tf is never NULL when sl_level exists
     if sl_level is not None and not sl_tf:
